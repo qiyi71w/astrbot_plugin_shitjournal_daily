@@ -691,6 +691,9 @@ class ShitJournalDailyPlugin(Star):
         arg_tokens = action_tokens[1:]
         arg_tokens.extend(self._split_command_tokens(arg_value))
         arg_tokens.extend(self._split_command_tokens(extra_value))
+        # Fallback: some AstrBot injection paths may place subcommand tokens into arg slots.
+        if action == default_action.strip().lower() and arg_tokens:
+            action = arg_tokens.pop(0)
         arg_text = " ".join(arg_tokens).strip()
         return action, arg_text
 
@@ -701,10 +704,12 @@ class ShitJournalDailyPlugin(Star):
         alias_key: str,
         positional_value: Any,
     ) -> Any:
-        if primary_key in kwargs and kwargs.get(primary_key) is not None:
-            return kwargs.get(primary_key)
-        if alias_key in kwargs and kwargs.get(alias_key) is not None:
-            return kwargs.get(alias_key)
+        primary_value = kwargs.get(primary_key)
+        if primary_key in kwargs and self._has_command_value(primary_value):
+            return primary_value
+        alias_value = kwargs.get(alias_key)
+        if alias_key in kwargs and self._has_command_value(alias_value):
+            return alias_value
         return positional_value
 
     def _split_command_tokens(self, value: Any) -> list[str]:
@@ -720,6 +725,9 @@ class ShitJournalDailyPlugin(Star):
         if not text:
             return []
         return [part for part in text.split() if part]
+
+    def _has_command_value(self, value: Any) -> bool:
+        return bool(self._split_command_tokens(value))
 
     def _cfg(self, key: str, default: Any) -> Any:
         try:
