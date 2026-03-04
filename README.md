@@ -28,6 +28,7 @@
 - `target_sessions`：会话列表（UMO）
 - `send_pdf`：是否附 PDF，默认 `false`
 - `pdf_dpi`：转图 DPI，默认 `170`
+- `send_concurrency`：并发推送会话数，默认 `3`（建议 `1-5`，最大 `20`）
 - `supabase_url`：Supabase API 地址
 - `supabase_publishable_key`：Supabase Publishable Key（已内置默认值，可覆盖；也可用环境变量 `SUPABASE_PUBLISHABLE_KEY`）
 - `command_admin_only`：仅管理员可用命令，默认 `true`

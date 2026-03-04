@@ -42,6 +42,12 @@
     "type": "int",
     "default": 3
   },
+  "send_concurrency": {
+    "description": "并发推送会话数",
+    "type": "int",
+    "default": 3,
+    "hint": "同时向多少个目标会话发送消息，建议 1-5"
+  },
   "temp_keep_files": {
     "description": "临时文件最多保留数量",
     "type": "int",
