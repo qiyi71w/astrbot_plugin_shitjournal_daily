@@ -59,6 +59,7 @@ class ShitJournalDailyPlugin(Star):
         self._run_lock = asyncio.Lock()
         self._cron_job_ids: list[str] = []
         self._chi_shi_cooldown_lock = asyncio.Lock()
+        self._chi_shi_dedupe_lock = asyncio.Lock()
         self._chi_shi_group_cooldown_until_monotonic: dict[str, float] = {}
         self._chi_shi_group_inflight: set[str] = set()
         self._plugin_data_dir = Path(".")
@@ -207,12 +208,18 @@ class ShitJournalDailyPlugin(Star):
             if not paper_id:
                 yield event.plain_result("最新论文缺少 ID。")
                 return
+            if await self._is_chi_shi_paper_already_sent(zone, session_key, paper_id):
+                success = True
+                yield event.plain_result("本群这篇论文已经推送过了，等待下一篇。")
+                return
 
             payload = await self._load_submission_payload(latest, paper_id)
             detail_url = f"https://shitjournal.org/preprints/{paper_id}"
             pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(payload, detail_url)
-            yield self._build_push_chain(text, png_file, pdf_file)
+            chain = self._build_push_chain(text, png_file, pdf_file)
+            await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
+            yield chain
             success = True
         except Exception as exc:
             logger.error(
@@ -757,6 +764,36 @@ class ShitJournalDailyPlugin(Star):
     async def _get_last_sent_target_map(self) -> dict[str, str]:
         raw = await self.get_kv_data("last_sent_by_target_zone", {})
         return self._clean_kv_dict(raw)
+
+    def _chi_shi_group_zone_key(self, zone: str, session: str) -> str:
+        return f"{zone}::{session}"
+
+    async def _get_chi_shi_sent_map(self) -> dict[str, str]:
+        raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
+        return self._clean_kv_dict(raw)
+
+    async def _is_chi_shi_paper_already_sent(
+        self,
+        zone: str,
+        session: str,
+        paper_id: str,
+    ) -> bool:
+        key = self._chi_shi_group_zone_key(zone, session)
+        async with self._chi_shi_dedupe_lock:
+            sent_map = await self._get_chi_shi_sent_map()
+            return str(sent_map.get(key, "")).strip() == paper_id
+
+    async def _mark_chi_shi_paper_sent(
+        self,
+        zone: str,
+        session: str,
+        paper_id: str,
+    ) -> None:
+        key = self._chi_shi_group_zone_key(zone, session)
+        async with self._chi_shi_dedupe_lock:
+            sent_map = await self._get_chi_shi_sent_map()
+            sent_map[key] = paper_id
+            await self.put_kv_data("chi_shi_last_sent_by_group_zone", sent_map)
 
     def _clean_kv_dict(self, raw: Any) -> dict[str, str]:
         if not isinstance(raw, dict):
