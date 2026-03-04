@@ -182,7 +182,12 @@ class ShitJournalDailyPlugin(Star):
         yield event.plain_result(help_text)
 
     @filter.command("我要赤石")
-    async def wo_yao_chi_shi(self, event: AstrMessageEvent):
+    async def wo_yao_chi_shi(
+        self,
+        event: AstrMessageEvent,
+        *_args: Any,
+        **_kwargs: Any,
+    ):
         """抓取最新论文并推送到当前群聊（按群冷却）"""
         if not event.get_group_id():
             yield event.plain_result("该指令仅支持群聊。")
