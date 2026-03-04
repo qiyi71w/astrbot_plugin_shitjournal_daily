@@ -25,6 +25,7 @@ DEFAULT_SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co"
 DEFAULT_SUPABASE_BUCKET = "manuscripts"
 DEFAULT_ZONE = "septic"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
+MAX_SEND_CONCURRENCY = 20
 SUPABASE_KEY_ENV_NAME = "SUPABASE_PUBLISHABLE_KEY"
 DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "interdisciplinary": ("交叉", "Interdisciplinary"),
@@ -68,7 +69,12 @@ class ShitJournalDailyPlugin(Star):
         self._plugin_data_dir = self._resolve_plugin_data_dir()
         self._temp_dir = self._plugin_data_dir / "tmp"
         self._ensure_supabase_key_or_raise()
-        self._send_concurrency = self._cfg_int("send_concurrency", 3, min_value=1)
+        self._send_concurrency = self._cfg_int(
+            "send_concurrency",
+            3,
+            min_value=1,
+            max_value=MAX_SEND_CONCURRENCY,
+        )
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         await self._clear_cron_jobs()
         await self._register_cron_jobs()
@@ -475,7 +481,12 @@ class ShitJournalDailyPlugin(Star):
         png_file: Path,
         pdf_file: Path,
     ) -> tuple[int, list[str]]:
-        concurrency = max(1, int(getattr(self, "_send_concurrency", 3)))
+        raw_concurrency = getattr(self, "_send_concurrency", 3)
+        try:
+            configured_concurrency = int(raw_concurrency)
+        except (TypeError, ValueError):
+            configured_concurrency = 3
+        concurrency = min(MAX_SEND_CONCURRENCY, max(1, configured_concurrency))
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _send_one(session: str) -> tuple[str, bool]:
@@ -489,8 +500,21 @@ class ShitJournalDailyPlugin(Star):
             logger.info("send message result: session=%s success=%s", session, ok)
             return session, ok
 
-        results = await asyncio.gather(*[_send_one(session) for session in targets])
-        success_targets = [session for session, ok in results if ok]
+        results = await asyncio.gather(
+            *[_send_one(session) for session in targets],
+            return_exceptions=True,
+        )
+        ok_results: list[tuple[str, bool]] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.error(
+                    "unexpected send task error",
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                continue
+            ok_results.append(result)
+
+        success_targets = [session for session, ok in ok_results if ok]
         sent_ok = len(success_targets)
         return sent_ok, success_targets
 
