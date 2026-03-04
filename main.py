@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -13,6 +14,7 @@ from urllib.parse import quote
 
 import fitz
 import requests
+from requests.adapters import HTTPAdapter
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.message_components import File, Image, Plain
@@ -53,15 +55,20 @@ class ShitJournalDailyPlugin(Star):
         self._run_lock = asyncio.Lock()
         self._cron_job_ids: list[str] = []
         self._chi_shi_cooldown_lock = asyncio.Lock()
-        self._chi_shi_group_last_ts: dict[str, float] = {}
+        self._chi_shi_group_last_ts_monotonic: dict[str, float] = {}
         self._chi_shi_group_inflight: set[str] = set()
         self._plugin_data_dir = Path(".")
         self._temp_dir = Path(".")
+        self._thread_local = threading.local()
+        self._session_registry_lock = threading.Lock()
+        self._session_registry: list[requests.Session] = []
+        self._send_concurrency = 3
 
     async def initialize(self):
         self._plugin_data_dir = self._resolve_plugin_data_dir()
         self._temp_dir = self._plugin_data_dir / "tmp"
         self._ensure_supabase_key_or_raise()
+        self._send_concurrency = self._cfg_int("send_concurrency", 3, min_value=1)
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         await self._clear_cron_jobs()
         await self._register_cron_jobs()
@@ -70,6 +77,7 @@ class ShitJournalDailyPlugin(Star):
 
     async def terminate(self):
         await self._clear_cron_jobs()
+        self._close_all_http_sessions()
         logger.info("shitjournal_daily terminated.")
 
     @filter.command("shitjournal")
@@ -145,7 +153,7 @@ class ShitJournalDailyPlugin(Star):
             yield event.plain_result("该指令仅支持群聊。")
             return
 
-        cooldown_sec = max(0, int(self._cfg("chi_shi_group_cooldown_sec", 60)))
+        cooldown_sec = self._cfg_int("chi_shi_group_cooldown_sec", 60, min_value=0)
         session_key = event.unified_msg_origin
         allowed, deny_reason = await self._try_enter_chi_shi_cooldown(
             session_key=session_key,
@@ -174,12 +182,15 @@ class ShitJournalDailyPlugin(Star):
             text = self._build_push_text(payload, detail_url)
             yield self._build_push_chain(text, png_file, pdf_file)
             success = True
-            await self._trim_temp_files()
         except Exception as exc:
             logger.error("chi_shi command failed: %s", exc, exc_info=True)
             yield event.plain_result(f"抓取失败：{exc}")
         finally:
             await self._leave_chi_shi_cooldown(session_key=session_key, success=success)
+            try:
+                await self._trim_temp_files()
+            except Exception:
+                logger.warning("trim temp files failed after chi_shi command", exc_info=True)
 
     async def _check_command_permission(self, event: AstrMessageEvent) -> bool:
         if not bool(self._cfg("command_admin_only", True)):
@@ -200,8 +211,8 @@ class ShitJournalDailyPlugin(Star):
             if session_key in self._chi_shi_group_inflight:
                 return False, "本群已有赤石任务在执行，请稍后再试。"
 
-            now = time.time()
-            last_ts = float(self._chi_shi_group_last_ts.get(session_key, 0.0))
+            now = time.monotonic()
+            last_ts = float(self._chi_shi_group_last_ts_monotonic.get(session_key, 0.0))
             remaining = cooldown_sec - (now - last_ts)
             if remaining > 0:
                 return False, f"本群冷却中，请 {int(remaining + 0.999)} 秒后再试。"
@@ -213,7 +224,7 @@ class ShitJournalDailyPlugin(Star):
         async with self._chi_shi_cooldown_lock:
             self._chi_shi_group_inflight.discard(session_key)
             if success:
-                self._chi_shi_group_last_ts[session_key] = time.time()
+                self._chi_shi_group_last_ts_monotonic[session_key] = time.monotonic()
 
     async def _register_cron_jobs(self) -> None:
         cron_manager = getattr(self.context, "cron_manager", None)
@@ -304,103 +315,106 @@ class ShitJournalDailyPlugin(Star):
                 "reason": "",
             }
             logger.info("run start: source=%s zone=%s force=%s", source, zone, force)
-            await self._trim_temp_files()
-
             try:
-                latest = await asyncio.to_thread(self._fetch_latest_submission, zone)
-            except Exception as exc:
-                logger.error("fetch latest failed: %s", exc, exc_info=True)
-                report["reason"] = f"fetch latest failed: {exc}"
-                return report
+                try:
+                    latest = await asyncio.to_thread(self._fetch_latest_submission, zone)
+                except Exception as exc:
+                    logger.error("fetch latest failed: %s", exc, exc_info=True)
+                    report["reason"] = f"fetch latest failed: {exc}"
+                    return report
 
-            if not latest:
-                report["reason"] = "latest submission not found"
-                return report
+                if not latest:
+                    report["reason"] = "latest submission not found"
+                    return report
 
-            paper_id = str(latest.get("id", "")).strip()
-            detail_url = f"https://shitjournal.org/preprints/{paper_id}" if paper_id else ""
-            report["paper_id"] = paper_id
-            report["detail_url"] = detail_url
-            logger.info("latest paper fetched: id=%s detail_url=%s", paper_id, detail_url)
+                paper_id = str(latest.get("id", "")).strip()
+                detail_url = f"https://shitjournal.org/preprints/{paper_id}" if paper_id else ""
+                report["paper_id"] = paper_id
+                report["detail_url"] = detail_url
+                logger.info("latest paper fetched: id=%s detail_url=%s", paper_id, detail_url)
 
-            if not paper_id:
-                report["reason"] = "empty paper id in latest submission"
-                return report
+                if not paper_id:
+                    report["reason"] = "empty paper id in latest submission"
+                    return report
 
-            targets = await self._get_all_target_sessions()
-            if not targets:
-                report["reason"] = "no target session configured"
-                return report
+                targets = await self._get_all_target_sessions()
+                if not targets:
+                    report["reason"] = "no target session configured"
+                    return report
 
-            payload = await self._load_submission_payload(latest, paper_id)
-            logger.info(
-                "submission metadata: %s",
-                json.dumps(self._build_meta_preview(payload), ensure_ascii=False),
-            )
+                payload = await self._load_submission_payload(latest, paper_id)
+                logger.info(
+                    "submission metadata: %s",
+                    json.dumps(self._build_meta_preview(payload), ensure_ascii=False),
+                )
 
-            last_seen_map = await self._get_last_seen_map()
-            last_sent_target_map = await self._get_last_sent_target_map()
-            pending_targets = self._filter_pending_targets(
-                zone=zone,
-                paper_id=paper_id,
-                targets=targets,
-                last_sent_target_map=last_sent_target_map,
-                force=force,
-            )
-            report["sent_total"] = len(pending_targets)
-            if not pending_targets:
-                report["status"] = "skipped"
-                report["reason"] = "already delivered to all targets"
-                if str(last_seen_map.get(zone, "")).strip() != paper_id:
-                    last_seen_map[zone] = paper_id
-                    await self.put_kv_data("last_seen_by_zone", last_seen_map)
-                return report
-
-            try:
-                pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
-            except Exception as exc:
-                report["reason"] = str(exc)
-                return report
-
-            text = self._build_push_text(payload, detail_url)
-            sent_ok, sent_success_targets = await self._send_push_to_targets(
-                targets=pending_targets,
-                text=text,
-                png_file=png_file,
-                pdf_file=pdf_file,
-            )
-            report["sent_ok"] = sent_ok
-            if sent_success_targets:
-                self._mark_targets_delivered(
+                last_seen_map = await self._get_last_seen_map()
+                last_sent_target_map = await self._get_last_sent_target_map()
+                pending_targets = self._filter_pending_targets(
                     zone=zone,
                     paper_id=paper_id,
-                    success_targets=sent_success_targets,
+                    targets=targets,
+                    last_sent_target_map=last_sent_target_map,
+                    force=force,
+                )
+                report["sent_total"] = len(pending_targets)
+                if not pending_targets:
+                    report["status"] = "skipped"
+                    report["reason"] = "already delivered to all targets"
+                    if str(last_seen_map.get(zone, "")).strip() != paper_id:
+                        last_seen_map[zone] = paper_id
+                        await self.put_kv_data("last_seen_by_zone", last_seen_map)
+                    return report
+
+                try:
+                    pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
+                except Exception as exc:
+                    report["reason"] = str(exc)
+                    return report
+
+                text = self._build_push_text(payload, detail_url)
+                sent_ok, sent_success_targets = await self._send_push_to_targets(
+                    targets=pending_targets,
+                    text=text,
+                    png_file=png_file,
+                    pdf_file=pdf_file,
+                )
+                report["sent_ok"] = sent_ok
+                if sent_success_targets:
+                    self._mark_targets_delivered(
+                        zone=zone,
+                        paper_id=paper_id,
+                        success_targets=sent_success_targets,
+                        last_sent_target_map=last_sent_target_map,
+                    )
+                    await self.put_kv_data("last_sent_by_target_zone", last_sent_target_map)
+
+                all_delivered = self._all_targets_delivered(
+                    zone=zone,
+                    paper_id=paper_id,
+                    targets=targets,
                     last_sent_target_map=last_sent_target_map,
                 )
-                await self.put_kv_data("last_sent_by_target_zone", last_sent_target_map)
+                if all_delivered:
+                    last_seen_map[zone] = paper_id
+                    await self.put_kv_data("last_seen_by_zone", last_seen_map)
 
-            all_delivered = self._all_targets_delivered(
-                zone=zone,
-                paper_id=paper_id,
-                targets=targets,
-                last_sent_target_map=last_sent_target_map,
-            )
-            if all_delivered:
-                last_seen_map[zone] = paper_id
-                await self.put_kv_data("last_seen_by_zone", last_seen_map)
+                if sent_ok == len(pending_targets):
+                    report["status"] = "success"
+                    report["reason"] = "pushed successfully"
+                elif sent_ok > 0:
+                    report["status"] = "partial"
+                    report["reason"] = "partially sent"
+                else:
+                    report["status"] = "failed"
+                    report["reason"] = "all sends failed"
 
-            if sent_ok == len(pending_targets):
-                report["status"] = "success"
-                report["reason"] = "pushed successfully"
-            elif sent_ok > 0:
-                report["status"] = "partial"
-                report["reason"] = "partially sent"
-            else:
-                report["status"] = "failed"
-                report["reason"] = "all sends failed"
-
-            await self._trim_temp_files()
-            return report
+                return report
+            finally:
+                try:
+                    await self._trim_temp_files()
+                except Exception:
+                    logger.warning("trim temp files failed after run_cycle", exc_info=True)
 
     async def _load_submission_payload(
         self,
@@ -443,7 +457,7 @@ class ShitJournalDailyPlugin(Star):
             logger.error("download pdf failed: %s", exc, exc_info=True)
             raise RuntimeError(f"download pdf failed: {exc}") from exc
 
-        dpi = int(self._cfg("pdf_dpi", 170))
+        dpi = self._cfg_int("pdf_dpi", 170, min_value=72, max_value=300)
         try:
             await asyncio.to_thread(self._export_first_page_png, pdf_file, png_file, dpi)
         except Exception as exc:
@@ -461,19 +475,23 @@ class ShitJournalDailyPlugin(Star):
         png_file: Path,
         pdf_file: Path,
     ) -> tuple[int, list[str]]:
-        sent_ok = 0
-        success_targets: list[str] = []
-        for session in targets:
-            chain = self._build_push_chain(text, png_file, pdf_file)
+        concurrency = max(1, int(getattr(self, "_send_concurrency", 3)))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _send_one(session: str) -> tuple[str, bool]:
             ok = False
-            try:
-                ok = await self.context.send_message(session, chain)
-            except Exception:
-                logger.error("send message failed: session=%s", session, exc_info=True)
+            async with semaphore:
+                try:
+                    chain = self._build_push_chain(text, png_file, pdf_file)
+                    ok = await self.context.send_message(session, chain)
+                except Exception:
+                    logger.error("send message failed: session=%s", session, exc_info=True)
             logger.info("send message result: session=%s success=%s", session, ok)
-            if ok:
-                sent_ok += 1
-                success_targets.append(session)
+            return session, ok
+
+        results = await asyncio.gather(*[_send_one(session) for session in targets])
+        success_targets = [session for session, ok in results if ok]
+        sent_ok = len(success_targets)
         return sent_ok, success_targets
 
     def _build_push_chain(self, text: str, png_file: Path, pdf_file: Path) -> MessageEventResult:
@@ -563,7 +581,7 @@ class ShitJournalDailyPlugin(Star):
 
         for attempt in range(1, retry + 1):
             try:
-                with requests.request(
+                with self._get_http_session().request(
                     method="GET",
                     url=signed_url,
                     headers=headers,
@@ -580,7 +598,7 @@ class ShitJournalDailyPlugin(Star):
                             retry,
                             signed_url,
                         )
-                        time.sleep(2 ** (attempt - 1))
+                        self._backoff_sleep(attempt)
                         continue
                     if status_code >= 400:
                         body_preview = response.text[:300]
@@ -608,7 +626,7 @@ class ShitJournalDailyPlugin(Star):
                         signed_url,
                         exc,
                     )
-                    time.sleep(2 ** (attempt - 1))
+                    self._backoff_sleep(attempt)
                     continue
                 break
 
@@ -648,7 +666,7 @@ class ShitJournalDailyPlugin(Star):
         last_error: Exception | None = None
         for attempt in range(1, retry + 1):
             try:
-                with requests.request(
+                with self._get_http_session().request(
                     method=method,
                     url=url,
                     params=params,
@@ -665,7 +683,7 @@ class ShitJournalDailyPlugin(Star):
                             retry,
                             url,
                         )
-                        time.sleep(2 ** (attempt - 1))
+                        self._backoff_sleep(attempt)
                         continue
                     if response.status_code >= 400:
                         body_preview = response.text[:300]
@@ -688,7 +706,7 @@ class ShitJournalDailyPlugin(Star):
                         url,
                         exc,
                     )
-                    time.sleep(2 ** (attempt - 1))
+                    self._backoff_sleep(attempt)
                     continue
                 break
 
@@ -696,10 +714,38 @@ class ShitJournalDailyPlugin(Star):
         raise last_error
 
     def _http_request_options(self) -> tuple[int, int, dict[str, str]]:
-        timeout = max(5, int(self._cfg("http_timeout_sec", 20)))
-        retry = max(1, int(self._cfg("http_retry", 3)))
+        timeout = self._cfg_int("http_timeout_sec", 20, min_value=5)
+        retry = self._cfg_int("http_retry", 3, min_value=1)
         headers = self._build_supabase_headers()
         return timeout, retry, headers
+
+    def _backoff_sleep(self, attempt: int) -> None:
+        delay = min(2 ** (attempt - 1), 8)
+        time.sleep(delay)
+
+    def _get_http_session(self) -> requests.Session:
+        session = getattr(self._thread_local, "http_session", None)
+        if session is not None:
+            return session
+
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        self._thread_local.http_session = session
+        with self._session_registry_lock:
+            self._session_registry.append(session)
+        return session
+
+    def _close_all_http_sessions(self) -> None:
+        with self._session_registry_lock:
+            sessions = self._session_registry[:]
+            self._session_registry.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                logger.warning("close http session failed", exc_info=True)
 
     def _build_supabase_headers(self) -> dict[str, str]:
         key = self._get_supabase_key()
@@ -738,6 +784,25 @@ class ShitJournalDailyPlugin(Star):
         except Exception:
             pass
         return default
+
+    def _cfg_int(
+        self,
+        key: str,
+        default: int,
+        min_value: int | None = None,
+        max_value: int | None = None,
+    ) -> int:
+        raw = self._cfg(key, default)
+        try:
+            value = int(raw)
+        except Exception:
+            value = default
+
+        if min_value is not None:
+            value = max(min_value, value)
+        if max_value is not None:
+            value = min(max_value, value)
+        return value
 
     def _parse_hhmm(self, value: str) -> tuple[int, int] | None:
         text = str(value).strip()
@@ -881,8 +946,7 @@ class ShitJournalDailyPlugin(Star):
         return pdf_file, png_file
 
     async def _trim_temp_files(self) -> None:
-        keep = int(self._cfg("temp_keep_files", 30))
-        keep = max(0, keep)
+        keep = self._cfg_int("temp_keep_files", 30, min_value=0)
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         files = [p for p in self._temp_dir.iterdir() if p.is_file()]
         files.sort(key=lambda p: p.stat().st_mtime, reverse=True)

@@ -1,6 +1,6 @@
 name: astrbot_plugin_shitjournal_daily
 display_name: shitjournal_daily
 desc: 每日定时抓取并推送 shitjournal 最新论文
-version: v1.0.1
+version: v1.0.2
 author: qiyi71w
 repo: https://github.com/qiyi71w/astrbot_plugin_shitjournal_daily
