@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import threading
 import time
 from pathlib import Path
@@ -8,8 +7,10 @@ from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 import requests
-from requests.adapters import HTTPAdapter
 from astrbot.api import logger
+from requests.adapters import HTTPAdapter
+
+from .sensitive import mask_sensitive_text
 
 
 class SupabaseClient:
@@ -159,7 +160,7 @@ class SupabaseClient:
                         attempt,
                         retry,
                         safe_url,
-                        self._mask_text(str(exc)),
+                        mask_sensitive_text(str(exc)),
                     )
                     self._backoff_sleep(attempt)
                     continue
@@ -239,7 +240,7 @@ class SupabaseClient:
                         attempt,
                         retry,
                         safe_url,
-                        self._mask_text(str(exc)),
+                        mask_sensitive_text(str(exc)),
                     )
                     self._backoff_sleep(attempt)
                     continue
@@ -297,15 +298,8 @@ class SupabaseClient:
         text = str(url).strip()
         parsed = urlsplit(text)
         if not parsed.scheme and not parsed.netloc:
-            return self._mask_text(text)
+            return mask_sensitive_text(text)
         base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         if parsed.query:
             return f"{base}?<redacted>"
         return base
-
-    def _mask_text(self, text: str) -> str:
-        masked = str(text)
-        masked = re.sub(r"(token=)[^&\s]+", r"\1<hidden>", masked, flags=re.IGNORECASE)
-        masked = re.sub(r"(apikey=)[^&\s]+", r"\1<hidden>", masked, flags=re.IGNORECASE)
-        masked = re.sub(r"(authorization:\s*bearer\s+)[^\s]+", r"\1<hidden>", masked, flags=re.I)
-        return masked

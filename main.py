@@ -17,11 +17,13 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 try:
     from .services import PdfService, SupabaseClient, TempFileManager
-except Exception:
+    from .services.sensitive import mask_sensitive_text
+except ImportError:
     _plugin_dir = Path(__file__).resolve().parent
     if str(_plugin_dir) not in sys.path:
         sys.path.insert(0, str(_plugin_dir))
     from services import PdfService, SupabaseClient, TempFileManager
+    from services.sensitive import mask_sensitive_text
 
 
 DEFAULT_SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co"
@@ -259,7 +261,7 @@ class ShitJournalDailyPlugin(Star):
         except Exception as exc:
             logger.error(
                 "chi_shi command failed: %s",
-                self._mask_sensitive_text(str(exc)),
+                mask_sensitive_text(str(exc)),
                 exc_info=True,
             )
             yield event.plain_result("抓取失败，请稍后重试。")
@@ -493,11 +495,11 @@ class ShitJournalDailyPlugin(Star):
                 except Exception as exc:
                     logger.error(
                         "fetch latest failed: %s",
-                        self._mask_sensitive_text(str(exc)),
+                        mask_sensitive_text(str(exc)),
                         exc_info=True,
                     )
                     report["reason_code"] = "FETCH_LATEST_FAILED"
-                    report["debug_reason"] = self._mask_sensitive_text(str(exc))
+                    report["debug_reason"] = mask_sensitive_text(str(exc))
                     return report
 
                 if not latest:
@@ -548,11 +550,11 @@ class ShitJournalDailyPlugin(Star):
                 except Exception as exc:
                     logger.error(
                         "prepare pdf assets failed: %s",
-                        self._mask_sensitive_text(str(exc)),
+                        mask_sensitive_text(str(exc)),
                         exc_info=True,
                     )
                     report["reason_code"] = "PREPARE_ASSETS_FAILED"
-                    report["debug_reason"] = self._mask_sensitive_text(str(exc))
+                    report["debug_reason"] = mask_sensitive_text(str(exc))
                     return report
 
                 text = self._build_push_text(payload, detail_url)
@@ -623,7 +625,7 @@ class ShitJournalDailyPlugin(Star):
         except Exception as exc:
             logger.error(
                 "create signed url failed: %s",
-                self._mask_sensitive_text(str(exc)),
+                mask_sensitive_text(str(exc)),
                 exc_info=True,
             )
             raise RuntimeError("create signed url failed") from exc
@@ -646,7 +648,7 @@ class ShitJournalDailyPlugin(Star):
             except Exception as exc:
                 logger.error(
                     "download pdf failed: %s",
-                    self._mask_sensitive_text(str(exc)),
+                    mask_sensitive_text(str(exc)),
                     exc_info=True,
                 )
                 raise RuntimeError("download pdf failed") from exc
@@ -657,7 +659,7 @@ class ShitJournalDailyPlugin(Star):
             except Exception as exc:
                 logger.error(
                     "export page1 failed: %s",
-                    self._mask_sensitive_text(str(exc)),
+                    mask_sensitive_text(str(exc)),
                     exc_info=True,
                 )
                 raise RuntimeError("export page1 failed") from exc
@@ -1166,13 +1168,6 @@ class ShitJournalDailyPlugin(Star):
         head, _, _ = url.partition("token=")
         return head + "token=<hidden>"
 
-    def _mask_sensitive_text(self, text: str) -> str:
-        masked = str(text)
-        masked = re.sub(r"(token=)[^&\s]+", r"\1<hidden>", masked, flags=re.IGNORECASE)
-        masked = re.sub(r"(apikey=)[^&\s]+", r"\1<hidden>", masked, flags=re.IGNORECASE)
-        masked = re.sub(r"(authorization:\s*bearer\s+)[^\s]+", r"\1<hidden>", masked, flags=re.I)
-        return masked
-
     def _build_meta_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
         keys = [
             "id",
@@ -1193,7 +1188,7 @@ class ShitJournalDailyPlugin(Star):
     def _render_report(self, report: dict[str, Any], include_debug: bool = False) -> str:
         status = report.get("status", "unknown")
         reason_code = str(report.get("reason_code") or report.get("reason") or "UNKNOWN")
-        debug_reason = self._mask_sensitive_text(str(report.get("debug_reason", "")).strip())
+        debug_reason = mask_sensitive_text(str(report.get("debug_reason", "")).strip())
         paper_id = report.get("paper_id", "")
         sent_ok = report.get("sent_ok", 0)
         sent_total = report.get("sent_total", 0)
