@@ -29,6 +29,8 @@ DEFAULT_SUPABASE_BUCKET = "manuscripts"
 DEFAULT_ZONE = "septic"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
+CHI_SHI_FETCH_CANDIDATE_LIMIT = 5
+CHI_SHI_SENT_HISTORY_KEEP = 30
 SUPABASE_KEY_ENV_NAME = "SUPABASE_PUBLISHABLE_KEY"
 DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "interdisciplinary": ("交叉", "Interdisciplinary"),
@@ -207,21 +209,31 @@ class ShitJournalDailyPlugin(Star):
         png_file: Path | None = None
         try:
             zone = str(self._cfg("zone", DEFAULT_ZONE)).strip() or DEFAULT_ZONE
-            latest = await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
-            if not latest:
+            candidates = await asyncio.to_thread(
+                self._supabase.fetch_latest_submissions,
+                zone,
+                CHI_SHI_FETCH_CANDIDATE_LIMIT,
+            )
+            if not candidates:
                 yield event.plain_result("未找到最新论文。")
                 return
 
-            paper_id = str(latest.get("id", "")).strip()
-            if not paper_id:
-                yield event.plain_result("最新论文缺少 ID。")
-                return
-            if await self._is_chi_shi_paper_already_sent(zone, session_key, paper_id):
+            candidate = await self._pick_chi_shi_candidate(
+                zone=zone,
+                session_key=session_key,
+                candidates=candidates,
+            )
+            if not candidate:
                 success = True
-                yield event.plain_result("本群这篇论文已经推送过了，等待下一篇。")
+                yield event.plain_result("本群最近这些论文都推送过了，等下一篇。")
                 return
 
-            payload = await self._load_submission_payload(latest, paper_id)
+            paper_id = str(candidate.get("id", "")).strip()
+            if not paper_id:
+                yield event.plain_result("候选论文缺少 ID。")
+                return
+
+            payload = await self._load_submission_payload(candidate, paper_id)
             detail_url = f"https://shitjournal.org/preprints/{paper_id}"
             pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(payload, detail_url)
@@ -776,20 +788,33 @@ class ShitJournalDailyPlugin(Star):
     def _chi_shi_group_zone_key(self, zone: str, session: str) -> str:
         return f"{zone}::{session}"
 
-    async def _get_chi_shi_sent_map(self) -> dict[str, str]:
-        raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
-        return self._clean_kv_dict(raw)
+    async def _get_chi_shi_sent_history_map(self) -> dict[str, list[str]]:
+        raw = await self.get_kv_data("chi_shi_sent_history_by_group_zone", {})
+        history_map = self._clean_kv_list_dict(raw)
+        if history_map:
+            return history_map
 
-    async def _is_chi_shi_paper_already_sent(
+        # Backward compatibility: migrate single-value map on first read.
+        legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
+        legacy_map = self._clean_kv_dict(legacy_raw)
+        return {key: [paper_id] for key, paper_id in legacy_map.items()}
+
+    async def _pick_chi_shi_candidate(
         self,
         zone: str,
-        session: str,
-        paper_id: str,
-    ) -> bool:
-        key = self._chi_shi_group_zone_key(zone, session)
+        session_key: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        key = self._chi_shi_group_zone_key(zone, session_key)
         async with self._chi_shi_dedupe_lock:
-            sent_map = await self._get_chi_shi_sent_map()
-            return str(sent_map.get(key, "")).strip() == paper_id
+            history_map = await self._get_chi_shi_sent_history_map()
+            sent_set = set(history_map.get(key, []))
+
+        for candidate in candidates:
+            paper_id = str(candidate.get("id", "")).strip()
+            if paper_id and paper_id not in sent_set:
+                return candidate
+        return None
 
     async def _mark_chi_shi_paper_sent(
         self,
@@ -799,9 +824,18 @@ class ShitJournalDailyPlugin(Star):
     ) -> None:
         key = self._chi_shi_group_zone_key(zone, session)
         async with self._chi_shi_dedupe_lock:
-            sent_map = await self._get_chi_shi_sent_map()
-            sent_map[key] = paper_id
-            await self.put_kv_data("chi_shi_last_sent_by_group_zone", sent_map)
+            history_map = await self._get_chi_shi_sent_history_map()
+            history = history_map.get(key, [])
+            history = [item for item in history if item != paper_id]
+            history.insert(0, paper_id)
+            history_map[key] = history[:CHI_SHI_SENT_HISTORY_KEEP]
+            await self.put_kv_data("chi_shi_sent_history_by_group_zone", history_map)
+
+            # Keep legacy key for compatibility with old data readers.
+            legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
+            legacy_map = self._clean_kv_dict(legacy_raw)
+            legacy_map[key] = paper_id
+            await self.put_kv_data("chi_shi_last_sent_by_group_zone", legacy_map)
 
     def _clean_kv_dict(self, raw: Any) -> dict[str, str]:
         if not isinstance(raw, dict):
@@ -812,6 +846,30 @@ class ShitJournalDailyPlugin(Star):
             val_s = str(value).strip()
             if key_s and val_s:
                 result[key_s] = val_s
+        return result
+
+    def _clean_kv_list_dict(self, raw: Any) -> dict[str, list[str]]:
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, list[str]] = {}
+        for key, value in raw.items():
+            key_s = str(key).strip()
+            if not key_s:
+                continue
+            if isinstance(value, list):
+                values = value
+            else:
+                values = [value]
+            cleaned: list[str] = []
+            seen: set[str] = set()
+            for item in values:
+                item_s = str(item).strip()
+                if not item_s or item_s in seen:
+                    continue
+                seen.add(item_s)
+                cleaned.append(item_s)
+            if cleaned:
+                result[key_s] = cleaned
         return result
 
     def _target_zone_key(self, zone: str, session: str) -> str:

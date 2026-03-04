@@ -41,6 +41,13 @@ class SupabaseClient:
                 logger.warning("close http session failed", exc_info=True)
 
     def fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
+        latest_list = self.fetch_latest_submissions(zone=zone, limit=1)
+        if not latest_list:
+            return None
+        return latest_list[0]
+
+    def fetch_latest_submissions(self, zone: str, limit: int) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 20))
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
         select_fields = (
             "id,manuscript_title,author_name,institution,viscosity,discipline,"
@@ -50,7 +57,7 @@ class SupabaseClient:
         params = {
             "select": select_fields,
             "zone": f"eq.{zone}",
-            "limit": "1",
+            "limit": str(safe_limit),
         }
         if zone == "septic":
             params["order"] = "promoted_to_septic_at.desc.nullslast"
@@ -60,8 +67,12 @@ class SupabaseClient:
         url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
         data = self._request_json("GET", url, params=params)
         if not isinstance(data, list) or not data:
-            return None
-        return data[0]
+            return []
+        result: list[dict[str, Any]] = []
+        for item in data:
+            if isinstance(item, dict):
+                result.append(item)
+        return result
 
     def fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
