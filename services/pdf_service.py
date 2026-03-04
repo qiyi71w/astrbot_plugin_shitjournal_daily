@@ -11,9 +11,14 @@ class PdfService:
         self._cfg_int = cfg_int_getter
 
     def ensure_pdf_size_limit(self, pdf_file: Path) -> None:
+        if not pdf_file.exists():
+            raise RuntimeError(f"pdf file missing: {pdf_file}")
+        if not pdf_file.is_file():
+            raise RuntimeError(f"pdf path is not a file: {pdf_file}")
+
         max_pdf_mb = self._cfg_int("pdf_max_size_mb", 50, min_value=1, max_value=512)
         max_pdf_bytes = max_pdf_mb * 1024 * 1024
-        pdf_size = pdf_file.stat().st_size if pdf_file.exists() else 0
+        pdf_size = pdf_file.stat().st_size
         if pdf_size > max_pdf_bytes:
             raise RuntimeError(
                 f"pdf too large: {pdf_size} bytes exceeds configured limit {max_pdf_bytes} bytes",
