@@ -125,6 +125,13 @@ class ShitJournalDailyPlugin(Star):
             kwargs=kwargs,
             default_action="help",
         )
+        fallback_action, fallback_arg = self._parse_action_arg_from_message(
+            event=event,
+            command_name="shitjournal",
+        )
+        if fallback_action:
+            action = fallback_action
+            arg = fallback_arg
 
         if action == "bind":
             bound = await self._get_bound_sessions()
@@ -793,11 +800,44 @@ class ShitJournalDailyPlugin(Star):
         arg_tokens = action_tokens[1:]
         arg_tokens.extend(self._split_command_tokens(arg_value))
         arg_tokens.extend(self._split_command_tokens(extra_value))
-        # Fallback: some AstrBot injection paths may place subcommand tokens into arg slots.
         if action == default_action.strip().lower() and arg_tokens:
             action = arg_tokens.pop(0)
         arg_text = " ".join(arg_tokens).strip()
         return action, arg_text
+
+    def _parse_action_arg_from_message(
+        self,
+        event: AstrMessageEvent,
+        command_name: str,
+    ) -> tuple[str, str]:
+        message_text = ""
+        getter = getattr(event, "get_message_str", None)
+        if callable(getter):
+            message_text = str(getter() or "")
+        if not message_text:
+            message_text = str(getattr(event, "message_str", "") or "")
+
+        text = re.sub(r"\s+", " ", message_text).strip().lower()
+        if not text:
+            return "", ""
+
+        command = command_name.strip().lower()
+        if not command:
+            return "", ""
+
+        for candidate in (command, f"/{command}"):
+            if text == candidate:
+                return "help", ""
+            if text.startswith(f"{candidate} "):
+                tail = text[len(candidate) :].strip()
+                if not tail:
+                    return "help", ""
+                tokens = [part for part in tail.split(" ") if part]
+                action = tokens[0] if tokens else "help"
+                arg = " ".join(tokens[1:]).strip() if len(tokens) >= 2 else ""
+                return action, arg
+
+        return "", ""
 
     def _pick_command_value(
         self,
