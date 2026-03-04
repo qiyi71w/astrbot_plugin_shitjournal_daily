@@ -90,5 +90,11 @@
     "type": "int",
     "default": 60,
     "hint": "按群聊独立计时，不同群互不影响"
+  },
+  "chi_shi_group_fail_cooldown_sec": {
+    "description": "“/我要赤石”失败后冷却时间（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "抓取失败后仍施加短冷却，避免重试风暴"
   }
 }

@@ -35,6 +35,7 @@
 - `command_admin_only`：仅管理员可用命令，默认 `true`
 - `command_no_permission_reply`：无权限是否提示，默认 `true`
 - `chi_shi_group_cooldown_sec`：`/我要赤石` 群聊冷却秒数，默认 `60`（不同群独立计时）
+- `chi_shi_group_fail_cooldown_sec`：`/我要赤石` 失败后冷却秒数，默认 `10`
 
 ## 依赖
 `requirements.txt`:
