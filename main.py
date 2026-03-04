@@ -103,28 +103,18 @@ class ShitJournalDailyPlugin(Star):
     async def shitjournal(
         self,
         event: AstrMessageEvent,
-        action: str = "help",
-        arg: str = "",
-        extra_args: Any = None,
-        **_kwargs: Any,
+        *args: Any,
+        **kwargs: Any,
     ):
         """管理 shitjournal 每日推送：bind/unbind/targets/run/run force"""
         if not await self._check_command_permission(event):
             return
 
-        action = (action or "help").strip().lower()
-        arg_parts = [str(arg or "").strip().lower()]
-        normalized_extra: list[str] = []
-        if isinstance(extra_args, (list, tuple)):
-            normalized_extra = [str(part).strip().lower() for part in extra_args if str(part).strip()]
-        elif isinstance(extra_args, str):
-            normalized_extra = [part.strip().lower() for part in extra_args.split() if part.strip()]
-        elif extra_args is not None:
-            extra_text = str(extra_args).strip().lower()
-            if extra_text:
-                normalized_extra = [extra_text]
-        arg_parts.extend(normalized_extra)
-        arg = " ".join(part for part in arg_parts if part).strip()
+        action, arg = self._parse_command_action_arg(
+            args=args,
+            kwargs=kwargs,
+            default_action="help",
+        )
 
         if action == "bind":
             bound = await self._get_bound_sessions()
@@ -187,13 +177,12 @@ class ShitJournalDailyPlugin(Star):
     async def wo_yao_chi_shi(
         self,
         event: AstrMessageEvent,
-        _action: str = "",
-        _arg: str = "",
-        _extra_args: Any = None,
-        *_args: Any,
-        **_kwargs: Any,
+        *args: Any,
+        **kwargs: Any,
     ):
         """抓取最新论文并推送到当前群聊（按群冷却）"""
+        # Keep a broad signature for compatibility with different AstrBot command injectors.
+        _ = (args, kwargs)
         if not event.get_group_id():
             yield event.plain_result("该指令仅支持群聊。")
             return
@@ -666,6 +655,71 @@ class ShitJournalDailyPlugin(Star):
                 f"{SUPABASE_KEY_ENV_NAME}",
             )
         return key
+
+    def _parse_command_action_arg(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        default_action: str,
+    ) -> tuple[str, str]:
+        positional_action = args[0] if len(args) >= 1 else None
+        positional_arg = args[1] if len(args) >= 2 else None
+        positional_extra: Any = list(args[2:]) if len(args) >= 3 else None
+
+        action_value = self._pick_command_value(
+            kwargs=kwargs,
+            primary_key="action",
+            alias_key="_action",
+            positional_value=positional_action,
+        )
+        arg_value = self._pick_command_value(
+            kwargs=kwargs,
+            primary_key="arg",
+            alias_key="_arg",
+            positional_value=positional_arg,
+        )
+        extra_value = self._pick_command_value(
+            kwargs=kwargs,
+            primary_key="extra_args",
+            alias_key="_extra_args",
+            positional_value=positional_extra,
+        )
+
+        action_tokens = self._split_command_tokens(action_value)
+        action = action_tokens[0] if action_tokens else default_action.strip().lower()
+        action = action or default_action.strip().lower()
+        arg_tokens = action_tokens[1:]
+        arg_tokens.extend(self._split_command_tokens(arg_value))
+        arg_tokens.extend(self._split_command_tokens(extra_value))
+        arg_text = " ".join(arg_tokens).strip()
+        return action, arg_text
+
+    def _pick_command_value(
+        self,
+        kwargs: dict[str, Any],
+        primary_key: str,
+        alias_key: str,
+        positional_value: Any,
+    ) -> Any:
+        if primary_key in kwargs and kwargs.get(primary_key) is not None:
+            return kwargs.get(primary_key)
+        if alias_key in kwargs and kwargs.get(alias_key) is not None:
+            return kwargs.get(alias_key)
+        return positional_value
+
+    def _split_command_tokens(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            tokens: list[str] = []
+            for item in value:
+                tokens.extend(self._split_command_tokens(item))
+            return tokens
+
+        text = str(value).strip().lower()
+        if not text:
+            return []
+        return [part for part in text.split() if part]
 
     def _cfg(self, key: str, default: Any) -> Any:
         try:
