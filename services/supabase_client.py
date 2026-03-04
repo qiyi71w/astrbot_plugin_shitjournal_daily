@@ -4,11 +4,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
-from requests.adapters import HTTPAdapter
 from astrbot.api import logger
+from requests.adapters import HTTPAdapter
+
+from .sensitive import mask_sensitive_text
 
 
 class SupabaseClient:
@@ -40,6 +42,13 @@ class SupabaseClient:
                 logger.warning("close http session failed", exc_info=True)
 
     def fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
+        latest_list = self.fetch_latest_submissions(zone=zone, limit=1)
+        if not latest_list:
+            return None
+        return latest_list[0]
+
+    def fetch_latest_submissions(self, zone: str, limit: int) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 20))
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
         select_fields = (
             "id,manuscript_title,author_name,institution,viscosity,discipline,"
@@ -49,7 +58,7 @@ class SupabaseClient:
         params = {
             "select": select_fields,
             "zone": f"eq.{zone}",
-            "limit": "1",
+            "limit": str(safe_limit),
         }
         if zone == "septic":
             params["order"] = "promoted_to_septic_at.desc.nullslast"
@@ -59,8 +68,12 @@ class SupabaseClient:
         url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
         data = self._request_json("GET", url, params=params)
         if not isinstance(data, list) or not data:
-            return None
-        return data[0]
+            return []
+        result: list[dict[str, Any]] = []
+        for item in data:
+            if isinstance(item, dict):
+                result.append(item)
+        return result
 
     def fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
@@ -83,10 +96,13 @@ class SupabaseClient:
         data = self._request_json("POST", url, json_body={"expiresIn": 3600})
         signed = str((data or {}).get("signedURL", "")).strip()
         if not signed:
-            raise RuntimeError(f"signedURL missing in response: {data}")
+            logger.error("signedURL missing in response: url=%s", self._mask_url(url))
+            raise RuntimeError("signedURL missing in response")
         return f"{supabase_url}/storage/v1{signed}"
 
     def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
+        signed_url = self._validate_signed_url(signed_url)
+        safe_url = self._mask_url(signed_url)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         timeout, retry, headers = self._http_request_options()
         last_error: Exception | None = None
@@ -110,14 +126,20 @@ class SupabaseClient:
                             status_code,
                             attempt,
                             retry,
-                            signed_url,
+                            safe_url,
                         )
                         self._backoff_sleep(attempt)
                         continue
                     if status_code >= 400:
                         body_preview = response.text[:300]
+                        logger.warning(
+                            "pdf download http error: status=%s url=%s body=%s",
+                            status_code,
+                            safe_url,
+                            body_preview,
+                        )
                         raise RuntimeError(
-                            f"http error {status_code} for {signed_url}; body={body_preview}",
+                            f"http error {status_code} while downloading pdf",
                         )
                     if "application/pdf" not in content_type.lower():
                         logger.warning(
@@ -137,8 +159,8 @@ class SupabaseClient:
                         "pdf download retry due to exception attempt=%s/%s url=%s err=%s",
                         attempt,
                         retry,
-                        signed_url,
-                        exc,
+                        safe_url,
+                        mask_sensitive_text(str(exc)),
                     )
                     self._backoff_sleep(attempt)
                     continue
@@ -163,6 +185,7 @@ class SupabaseClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
+        safe_url = self._mask_url(url)
         timeout, retry, headers = self._http_request_options()
         last_error: Exception | None = None
         for attempt in range(1, retry + 1):
@@ -182,21 +205,33 @@ class SupabaseClient:
                             response.status_code,
                             attempt,
                             retry,
-                            url,
+                            safe_url,
                         )
                         self._backoff_sleep(attempt)
                         continue
                     if response.status_code >= 400:
                         body_preview = response.text[:300]
+                        logger.warning(
+                            "supabase request http error: status=%s url=%s body=%s",
+                            response.status_code,
+                            safe_url,
+                            body_preview,
+                        )
                         raise RuntimeError(
-                            f"http error {response.status_code} for {url}; body={body_preview}",
+                            f"http error {response.status_code} for supabase request",
                         )
                     try:
                         return response.json()
-                    except Exception as exc:
+                    except Exception:
+                        body_preview = response.text[:300]
+                        logger.warning(
+                            "supabase json decode failed: url=%s body=%s",
+                            safe_url,
+                            body_preview,
+                        )
                         raise RuntimeError(
-                            f"json decode failed: {exc}; body={response.text[:300]}",
-                        ) from exc
+                            "json decode failed for supabase response",
+                        )
             except Exception as exc:
                 last_error = exc
                 if attempt < retry:
@@ -204,8 +239,8 @@ class SupabaseClient:
                         "http retrying due to exception attempt=%s/%s url=%s err=%s",
                         attempt,
                         retry,
-                        url,
-                        exc,
+                        safe_url,
+                        mask_sensitive_text(str(exc)),
                     )
                     self._backoff_sleep(attempt)
                     continue
@@ -246,3 +281,25 @@ class SupabaseClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+
+    def _validate_signed_url(self, signed_url: str) -> str:
+        parsed = urlsplit(str(signed_url).strip())
+        if parsed.scheme.lower() != "https":
+            raise RuntimeError("invalid signed url: scheme must be https")
+
+        expected = urlsplit(str(self._cfg("supabase_url", self._default_url)).strip())
+        expected_host = (expected.hostname or "").lower()
+        actual_host = (parsed.hostname or "").lower()
+        if (not expected_host) or actual_host != expected_host:
+            raise RuntimeError("invalid signed url: unexpected host")
+        return signed_url
+
+    def _mask_url(self, url: str) -> str:
+        text = str(url).strip()
+        parsed = urlsplit(text)
+        if not parsed.scheme and not parsed.netloc:
+            return mask_sensitive_text(text)
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if parsed.query:
+            return f"{base}?<redacted>"
+        return base
