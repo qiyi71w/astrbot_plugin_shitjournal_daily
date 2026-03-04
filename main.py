@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,14 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star, StarTools, register
-from services import PdfService, SupabaseClient, TempFileManager
+
+try:
+    from .services import PdfService, SupabaseClient, TempFileManager
+except Exception:
+    _plugin_dir = Path(__file__).resolve().parent
+    if str(_plugin_dir) not in sys.path:
+        sys.path.insert(0, str(_plugin_dir))
+    from services import PdfService, SupabaseClient, TempFileManager
 
 
 DEFAULT_SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co"
