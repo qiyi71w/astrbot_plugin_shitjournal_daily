@@ -24,6 +24,20 @@ DEFAULT_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_wHqWLjQwO2lMwkGLeBktng_Mk_xf5
 DEFAULT_SUPABASE_BUCKET = "manuscripts"
 DEFAULT_ZONE = "septic"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
+DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
+    "interdisciplinary": ("交叉", "Interdisciplinary"),
+    "science": ("理", "Science"),
+    "engineering": ("工", "Engineering"),
+    "medical": ("医", "Medical"),
+    "agriculture": ("农", "Agriculture"),
+    "law_social": ("法社", "Law & Social"),
+    "humanities": ("文", "Humanities"),
+}
+VISCOSITY_LABELS: dict[str, tuple[str, str]] = {
+    "stringy": ("拉丝型", "Stringy"),
+    "semi": ("半固态", "Semi-solid"),
+    "high-entropy": ("高熵态", "High-Entropy"),
+}
 
 
 @register(
@@ -349,14 +363,14 @@ class ShitJournalDailyPlugin(Star):
         author = self._fallback_text(payload.get("author_name"))
         institution = self._fallback_text(payload.get("institution"))
         submitted = self._format_datetime(payload.get("created_at"))
-        discipline = self._fallback_text(payload.get("discipline"))
-        viscosity = self._fallback_text(payload.get("viscosity"))
+        discipline = self._format_bilingual_label(payload.get("discipline"), DISCIPLINE_LABELS)
+        viscosity = self._format_bilingual_label(payload.get("viscosity"), VISCOSITY_LABELS)
         avg_score = self._format_number(payload.get("avg_score"))
         weighted_score = self._format_number(payload.get("weighted_score"))
         rating_count = self._fallback_text(payload.get("rating_count"))
 
         return (
-            "ShitJournal 最新论文推送\n"
+            "S.H.I.T Journal 最新论文推送\n"
             f"标题: {title}\n"
             f"作者: {author}\n"
             f"单位: {institution}\n"
@@ -650,6 +664,20 @@ class ShitJournalDailyPlugin(Star):
     def _fallback_text(self, value: Any) -> str:
         text = str(value or "").strip()
         return text if text else "N/A"
+
+    def _format_bilingual_label(
+        self,
+        raw_value: Any,
+        mapping: dict[str, tuple[str, str]],
+    ) -> str:
+        text = str(raw_value or "").strip()
+        if not text:
+            return "N/A"
+        key = text.lower()
+        if key in mapping:
+            cn, en = mapping[key]
+            return f"{cn} / {en}"
+        return text
 
     def _mask_token(self, url: str) -> str:
         if "token=" not in url:

@@ -37,4 +37,3 @@
 
 ## 说明
 - 管理员身份依赖 AstrBot 全局 `admins_id` 配置。
-- 仅“命令”受 `command_admin_only` 控制，定时任务不受影响。
