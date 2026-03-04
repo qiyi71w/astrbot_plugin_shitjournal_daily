@@ -4,21 +4,16 @@ import asyncio
 import json
 import os
 import re
-import threading
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
-import fitz
-import requests
-from requests.adapters import HTTPAdapter
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star, StarTools, register
+from services import PdfService, SupabaseClient, TempFileManager
 
 
 DEFAULT_SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co"
@@ -60,14 +55,21 @@ class ShitJournalDailyPlugin(Star):
         self._chi_shi_group_inflight: set[str] = set()
         self._plugin_data_dir = Path(".")
         self._temp_dir = Path(".")
-        self._thread_local = threading.local()
-        self._session_registry_lock = threading.Lock()
-        self._session_registry: list[requests.Session] = []
         self._send_concurrency = 3
+        self._supabase = SupabaseClient(
+            cfg_getter=self._cfg,
+            cfg_int_getter=self._cfg_int,
+            key_getter=self._get_supabase_key,
+            default_url=DEFAULT_SUPABASE_URL,
+            default_bucket=DEFAULT_SUPABASE_BUCKET,
+        )
+        self._pdf_service = PdfService(cfg_int_getter=self._cfg_int)
+        self._temp_files = TempFileManager(self._temp_dir, cfg_int_getter=self._cfg_int)
 
     async def initialize(self):
         self._plugin_data_dir = self._resolve_plugin_data_dir()
         self._temp_dir = self._plugin_data_dir / "tmp"
+        self._temp_files.set_temp_dir(self._temp_dir)
         self._ensure_supabase_key_or_raise()
         self._send_concurrency = self._cfg_int(
             "send_concurrency",
@@ -78,22 +80,30 @@ class ShitJournalDailyPlugin(Star):
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         await self._clear_cron_jobs()
         await self._register_cron_jobs()
-        await self._trim_temp_files()
+        await self._temp_files.trim()
         logger.info("shitjournal_daily initialized.")
 
     async def terminate(self):
         await self._clear_cron_jobs()
-        self._close_all_http_sessions()
+        self._supabase.close()
         logger.info("shitjournal_daily terminated.")
 
     @filter.command("shitjournal")
-    async def shitjournal(self, event: AstrMessageEvent, action: str = "help", arg: str = ""):
+    async def shitjournal(
+        self,
+        event: AstrMessageEvent,
+        action: str = "help",
+        arg: str = "",
+        *extra_args: str,
+    ):
         """管理 shitjournal 每日推送：bind/unbind/targets/run/run force"""
         if not await self._check_command_permission(event):
             return
 
         action = (action or "help").strip().lower()
-        arg = (arg or "").strip().lower()
+        arg_parts = [str(arg or "").strip().lower()]
+        arg_parts.extend(str(part).strip().lower() for part in extra_args if str(part).strip())
+        arg = " ".join(part for part in arg_parts if part).strip()
 
         if action == "bind":
             bound = await self._get_bound_sessions()
@@ -137,7 +147,7 @@ class ShitJournalDailyPlugin(Star):
             return
 
         if action == "run":
-            force = arg == "force"
+            force = bool(arg) and arg.split()[0] == "force"
             report = await self._run_cycle(force=force, source=f"manual:{event.get_sender_id()}")
             yield event.plain_result(self._render_report(report))
             return
@@ -170,9 +180,11 @@ class ShitJournalDailyPlugin(Star):
             return
 
         success = False
+        pdf_file: Path | None = None
+        png_file: Path | None = None
         try:
             zone = str(self._cfg("zone", DEFAULT_ZONE)).strip() or DEFAULT_ZONE
-            latest = await asyncio.to_thread(self._fetch_latest_submission, zone)
+            latest = await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
             if not latest:
                 yield event.plain_result("未找到最新论文。")
                 return
@@ -193,17 +205,18 @@ class ShitJournalDailyPlugin(Star):
             yield event.plain_result(f"抓取失败：{exc}")
         finally:
             await self._leave_chi_shi_cooldown(session_key=session_key, success=success)
+            await self._temp_files.release(pdf_file, png_file)
             try:
-                await self._trim_temp_files()
+                await self._temp_files.trim()
             except Exception:
                 logger.warning("trim temp files failed after chi_shi command", exc_info=True)
 
     async def _check_command_permission(self, event: AstrMessageEvent) -> bool:
-        if not bool(self._cfg("command_admin_only", True)):
+        if not self._cfg_bool("command_admin_only", True):
             return True
         if event.is_admin():
             return True
-        if bool(self._cfg("command_no_permission_reply", True)):
+        if self._cfg_bool("command_no_permission_reply", True):
             await event.send(event.plain_result("权限不足：仅管理员可使用该指令。"))
         event.stop_event()
         return False
@@ -309,6 +322,8 @@ class ShitJournalDailyPlugin(Star):
 
         async with self._run_lock:
             zone = str(self._cfg("zone", DEFAULT_ZONE)).strip() or DEFAULT_ZONE
+            pdf_file: Path | None = None
+            png_file: Path | None = None
             report: dict[str, Any] = {
                 "status": "failed",
                 "source": source,
@@ -323,7 +338,7 @@ class ShitJournalDailyPlugin(Star):
             logger.info("run start: source=%s zone=%s force=%s", source, zone, force)
             try:
                 try:
-                    latest = await asyncio.to_thread(self._fetch_latest_submission, zone)
+                    latest = await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
                 except Exception as exc:
                     logger.error("fetch latest failed: %s", exc, exc_info=True)
                     report["reason"] = f"fetch latest failed: {exc}"
@@ -417,8 +432,9 @@ class ShitJournalDailyPlugin(Star):
 
                 return report
             finally:
+                await self._temp_files.release(pdf_file, png_file)
                 try:
-                    await self._trim_temp_files()
+                    await self._temp_files.trim()
                 except Exception:
                     logger.warning("trim temp files failed after run_cycle", exc_info=True)
 
@@ -428,7 +444,7 @@ class ShitJournalDailyPlugin(Star):
         paper_id: str,
     ) -> dict[str, Any]:
         try:
-            detail = await asyncio.to_thread(self._fetch_submission_detail, paper_id)
+            detail = await asyncio.to_thread(self._supabase.fetch_submission_detail, paper_id)
         except Exception:
             logger.warning("fetch detail failed, fallback to latest payload", exc_info=True)
             detail = {}
@@ -441,7 +457,7 @@ class ShitJournalDailyPlugin(Star):
             raise RuntimeError("pdf path missing in payload")
 
         try:
-            signed_url = await asyncio.to_thread(self._create_signed_pdf_url, pdf_key)
+            signed_url = await asyncio.to_thread(self._supabase.create_signed_pdf_url, pdf_key)
         except Exception as exc:
             logger.error("create signed url failed: %s", exc, exc_info=True)
             raise RuntimeError(f"create signed url failed: {exc}") from exc
@@ -450,29 +466,34 @@ class ShitJournalDailyPlugin(Star):
             raise RuntimeError("empty signed url")
 
         logger.info("signed pdf url selected: %s", self._mask_token(signed_url))
-        pdf_file, png_file = self._build_output_paths(paper_id)
+        pdf_file, png_file = self._temp_files.build_output_paths(paper_id)
+        await self._temp_files.mark_in_use(pdf_file, png_file)
 
         try:
-            pdf_status, pdf_type = await asyncio.to_thread(
-                self._download_pdf_file,
-                signed_url,
-                pdf_file,
-            )
-            logger.info("pdf downloaded: status=%s content-type=%s", pdf_status, pdf_type)
-        except Exception as exc:
-            logger.error("download pdf failed: %s", exc, exc_info=True)
-            raise RuntimeError(f"download pdf failed: {exc}") from exc
+            try:
+                pdf_status, pdf_type = await asyncio.to_thread(
+                    self._supabase.download_pdf_file,
+                    signed_url,
+                    pdf_file,
+                )
+                logger.info("pdf downloaded: status=%s content-type=%s", pdf_status, pdf_type)
+            except Exception as exc:
+                logger.error("download pdf failed: %s", exc, exc_info=True)
+                raise RuntimeError(f"download pdf failed: {exc}") from exc
 
-        dpi = self._cfg_int("pdf_dpi", 170, min_value=72, max_value=300)
-        try:
-            await asyncio.to_thread(self._export_first_page_png, pdf_file, png_file, dpi)
-        except Exception as exc:
-            logger.error("export page1 failed: %s", exc, exc_info=True)
-            raise RuntimeError(f"export page1 failed: {exc}") from exc
+            self._pdf_service.ensure_pdf_size_limit(pdf_file)
+            try:
+                await asyncio.to_thread(self._pdf_service.export_first_page_png, pdf_file, png_file)
+            except Exception as exc:
+                logger.error("export page1 failed: %s", exc, exc_info=True)
+                raise RuntimeError(f"export page1 failed: {exc}") from exc
 
-        png_size = png_file.stat().st_size if png_file.exists() else 0
-        logger.info("page1 png exported: file=%s bytes=%s", str(png_file), png_size)
-        return pdf_file, png_file
+            png_size = png_file.stat().st_size if png_file.exists() else 0
+            logger.info("page1 png exported: file=%s bytes=%s", str(png_file), png_size)
+            return pdf_file, png_file
+        except Exception:
+            await self._temp_files.release(pdf_file, png_file)
+            raise
 
     async def _send_push_to_targets(
         self,
@@ -522,7 +543,7 @@ class ShitJournalDailyPlugin(Star):
         chain = MessageEventResult()
         chain.chain.append(Plain(text))
         chain.chain.append(Image.fromFileSystem(str(png_file)))
-        if bool(self._cfg("send_pdf", False)):
+        if self._cfg_bool("send_pdf", False):
             chain.chain.append(File(name=pdf_file.name, file=str(pdf_file)))
         return chain
 
@@ -548,237 +569,6 @@ class ShitJournalDailyPlugin(Star):
             f"评分: avg={avg_score}, weighted={weighted_score}, votes={rating_count}\n"
             f"详情: {detail_url}"
         )
-
-    def _fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
-        supabase_url = str(self._cfg("supabase_url", DEFAULT_SUPABASE_URL)).strip()
-        select_fields = (
-            "id,manuscript_title,author_name,institution,viscosity,discipline,"
-            "created_at,avg_score,rating_count,weighted_score,co_authors,"
-            "solicited_topic,comment_count,unique_commenters,promoted_to_septic_at,pdf_path,zone"
-        )
-        params = {
-            "select": select_fields,
-            "zone": f"eq.{zone}",
-            "limit": "1",
-        }
-        if zone == "septic":
-            params["order"] = "promoted_to_septic_at.desc.nullslast"
-        else:
-            params["order"] = "created_at.desc"
-
-        url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
-        data = self._request_json("GET", url, params=params)
-        if not isinstance(data, list) or not data:
-            return None
-        return data[0]
-
-    def _fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
-        supabase_url = str(self._cfg("supabase_url", DEFAULT_SUPABASE_URL)).strip()
-        url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
-        params = {
-            "select": "*",
-            "id": f"eq.{paper_id}",
-            "limit": "1",
-        }
-        data = self._request_json("GET", url, params=params)
-        if not isinstance(data, list) or not data:
-            return {}
-        return data[0]
-
-    def _create_signed_pdf_url(self, pdf_path: str) -> str:
-        supabase_url = str(self._cfg("supabase_url", DEFAULT_SUPABASE_URL)).strip()
-        bucket = str(self._cfg("supabase_bucket", DEFAULT_SUPABASE_BUCKET)).strip()
-        escaped = quote(pdf_path, safe="/")
-        url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{escaped}"
-        data = self._request_json("POST", url, json_body={"expiresIn": 3600})
-        signed = str((data or {}).get("signedURL", "")).strip()
-        if not signed:
-            raise RuntimeError(f"signedURL missing in response: {data}")
-        return f"{supabase_url}/storage/v1{signed}"
-
-    def _download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        timeout, retry, headers = self._http_request_options()
-        last_error: Exception | None = None
-        status_code = 0
-        content_type = ""
-
-        for attempt in range(1, retry + 1):
-            try:
-                with self._get_http_session().request(
-                    method="GET",
-                    url=signed_url,
-                    headers=headers,
-                    timeout=timeout,
-                    stream=True,
-                ) as response:
-                    status_code = response.status_code
-                    content_type = str(response.headers.get("content-type", ""))
-                    if status_code >= 500 and attempt < retry:
-                        logger.warning(
-                            "pdf download retry due to status=%s attempt=%s/%s url=%s",
-                            status_code,
-                            attempt,
-                            retry,
-                            signed_url,
-                        )
-                        self._backoff_sleep(attempt)
-                        continue
-                    if status_code >= 400:
-                        body_preview = response.text[:300]
-                        raise RuntimeError(
-                            f"http error {status_code} for {signed_url}; body={body_preview}",
-                        )
-                    if "application/pdf" not in content_type.lower():
-                        logger.warning(
-                            "pdf content-type is not application/pdf: %s (will validate header)",
-                            content_type,
-                        )
-
-                    with target_path.open("wb") as fp:
-                        for chunk in response.iter_content(chunk_size=1024 * 64):
-                            if chunk:
-                                fp.write(chunk)
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt < retry:
-                    logger.warning(
-                        "pdf download retry due to exception attempt=%s/%s url=%s err=%s",
-                        attempt,
-                        retry,
-                        signed_url,
-                        exc,
-                    )
-                    self._backoff_sleep(attempt)
-                    continue
-                break
-
-        if (not target_path.exists()) or target_path.stat().st_size <= 0:
-            if last_error is not None:
-                raise last_error
-            raise RuntimeError("downloaded pdf file missing")
-
-        with target_path.open("rb") as fp:
-            header = fp.read(5)
-        if header != b"%PDF-":
-            raise RuntimeError("downloaded file is not a valid PDF")
-
-        return status_code, content_type
-
-    def _export_first_page_png(self, pdf_file: Path, png_file: Path, dpi: int) -> None:
-        dpi = max(72, min(dpi, 300))
-        pdf = fitz.open(str(pdf_file))
-        try:
-            if pdf.page_count < 1:
-                raise RuntimeError("pdf has no pages")
-            page = pdf.load_page(0)
-            scale = dpi / 72.0
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-            pix.save(str(png_file))
-        finally:
-            pdf.close()
-
-    def _request_json(
-        self,
-        method: str,
-        url: str,
-        params: dict[str, Any] | None = None,
-        json_body: dict[str, Any] | None = None,
-    ) -> Any:
-        timeout, retry, headers = self._http_request_options()
-        last_error: Exception | None = None
-        for attempt in range(1, retry + 1):
-            try:
-                with self._get_http_session().request(
-                    method=method,
-                    url=url,
-                    params=params,
-                    json=json_body,
-                    headers=headers,
-                    timeout=timeout,
-                    stream=False,
-                ) as response:
-                    if response.status_code >= 500 and attempt < retry:
-                        logger.warning(
-                            "http retrying due to status=%s attempt=%s/%s url=%s",
-                            response.status_code,
-                            attempt,
-                            retry,
-                            url,
-                        )
-                        self._backoff_sleep(attempt)
-                        continue
-                    if response.status_code >= 400:
-                        body_preview = response.text[:300]
-                        raise RuntimeError(
-                            f"http error {response.status_code} for {url}; body={body_preview}",
-                        )
-                    try:
-                        return response.json()
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"json decode failed: {exc}; body={response.text[:300]}",
-                        ) from exc
-            except Exception as exc:
-                last_error = exc
-                if attempt < retry:
-                    logger.warning(
-                        "http retrying due to exception attempt=%s/%s url=%s err=%s",
-                        attempt,
-                        retry,
-                        url,
-                        exc,
-                    )
-                    self._backoff_sleep(attempt)
-                    continue
-                break
-
-        assert last_error is not None
-        raise last_error
-
-    def _http_request_options(self) -> tuple[int, int, dict[str, str]]:
-        timeout = self._cfg_int("http_timeout_sec", 20, min_value=5)
-        retry = self._cfg_int("http_retry", 3, min_value=1)
-        headers = self._build_supabase_headers()
-        return timeout, retry, headers
-
-    def _backoff_sleep(self, attempt: int) -> None:
-        delay = min(2 ** (attempt - 1), 8)
-        time.sleep(delay)
-
-    def _get_http_session(self) -> requests.Session:
-        session = getattr(self._thread_local, "http_session", None)
-        if session is not None:
-            return session
-
-        session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        self._thread_local.http_session = session
-        with self._session_registry_lock:
-            self._session_registry.append(session)
-        return session
-
-    def _close_all_http_sessions(self) -> None:
-        with self._session_registry_lock:
-            sessions = self._session_registry[:]
-            self._session_registry.clear()
-        for session in sessions:
-            try:
-                session.close()
-            except Exception:
-                logger.warning("close http session failed", exc_info=True)
-
-    def _build_supabase_headers(self) -> dict[str, str]:
-        key = self._get_supabase_key()
-        return {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
 
     def _resolve_plugin_data_dir(self) -> Path:
         plugin_name = str(
@@ -807,6 +597,27 @@ class ShitJournalDailyPlugin(Star):
                 return self.config.get(key, default)
         except Exception:
             pass
+        return default
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        raw = self._cfg(key, default)
+        return self._to_bool(raw, default)
+
+    def _to_bool(self, value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+
+        text = str(value).strip().lower()
+        if not text:
+            return default
+        if text in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "f", "no", "n", "off"}:
+            return False
         return default
 
     def _cfg_int(
@@ -892,18 +703,13 @@ class ShitJournalDailyPlugin(Star):
 
     async def _get_last_seen_map(self) -> dict[str, str]:
         raw = await self.get_kv_data("last_seen_by_zone", {})
-        if not isinstance(raw, dict):
-            return {}
-        result: dict[str, str] = {}
-        for key, value in raw.items():
-            key_s = str(key).strip()
-            val_s = str(value).strip()
-            if key_s and val_s:
-                result[key_s] = val_s
-        return result
+        return self._clean_kv_dict(raw)
 
     async def _get_last_sent_target_map(self) -> dict[str, str]:
         raw = await self.get_kv_data("last_sent_by_target_zone", {})
+        return self._clean_kv_dict(raw)
+
+    def _clean_kv_dict(self, raw: Any) -> dict[str, str]:
         if not isinstance(raw, dict):
             return {}
         result: dict[str, str] = {}
@@ -959,26 +765,6 @@ class ShitJournalDailyPlugin(Star):
             if str(last_sent_target_map.get(key, "")).strip() != paper_id:
                 return False
         return True
-
-    def _build_output_paths(self, paper_id: str) -> tuple[Path, Path]:
-        self._temp_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        nonce = uuid.uuid4().hex[:8]
-        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", paper_id)
-        pdf_file = self._temp_dir / f"{ts}_{safe_id}_{nonce}.pdf"
-        png_file = self._temp_dir / f"{ts}_{safe_id}_{nonce}_p1.png"
-        return pdf_file, png_file
-
-    async def _trim_temp_files(self) -> None:
-        keep = self._cfg_int("temp_keep_files", 30, min_value=0)
-        self._temp_dir.mkdir(parents=True, exist_ok=True)
-        files = [p for p in self._temp_dir.iterdir() if p.is_file()]
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        for file_path in files[keep:]:
-            try:
-                file_path.unlink(missing_ok=True)
-            except Exception:
-                logger.warning("failed to delete temp file: %s", str(file_path), exc_info=True)
 
     def _format_datetime(self, value: Any) -> str:
         text = str(value or "").strip()

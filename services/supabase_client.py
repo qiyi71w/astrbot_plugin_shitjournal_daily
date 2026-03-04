@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import quote
+
+import requests
+from requests.adapters import HTTPAdapter
+from astrbot.api import logger
+
+
+class SupabaseClient:
+    def __init__(
+        self,
+        cfg_getter: Callable[[str, Any], Any],
+        cfg_int_getter: Callable[..., int],
+        key_getter: Callable[[], str],
+        default_url: str,
+        default_bucket: str,
+    ):
+        self._cfg = cfg_getter
+        self._cfg_int = cfg_int_getter
+        self._get_supabase_key = key_getter
+        self._default_url = default_url
+        self._default_bucket = default_bucket
+        self._thread_local = threading.local()
+        self._session_registry_lock = threading.Lock()
+        self._session_registry: list[requests.Session] = []
+
+    def close(self) -> None:
+        with self._session_registry_lock:
+            sessions = self._session_registry[:]
+            self._session_registry.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                logger.warning("close http session failed", exc_info=True)
+
+    def fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
+        supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
+        select_fields = (
+            "id,manuscript_title,author_name,institution,viscosity,discipline,"
+            "created_at,avg_score,rating_count,weighted_score,co_authors,"
+            "solicited_topic,comment_count,unique_commenters,promoted_to_septic_at,pdf_path,zone"
+        )
+        params = {
+            "select": select_fields,
+            "zone": f"eq.{zone}",
+            "limit": "1",
+        }
+        if zone == "septic":
+            params["order"] = "promoted_to_septic_at.desc.nullslast"
+        else:
+            params["order"] = "created_at.desc"
+
+        url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
+        data = self._request_json("GET", url, params=params)
+        if not isinstance(data, list) or not data:
+            return None
+        return data[0]
+
+    def fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
+        supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
+        url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
+        params = {
+            "select": "*",
+            "id": f"eq.{paper_id}",
+            "limit": "1",
+        }
+        data = self._request_json("GET", url, params=params)
+        if not isinstance(data, list) or not data:
+            return {}
+        return data[0]
+
+    def create_signed_pdf_url(self, pdf_path: str) -> str:
+        supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
+        bucket = str(self._cfg("supabase_bucket", self._default_bucket)).strip()
+        escaped = quote(pdf_path, safe="/")
+        url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{escaped}"
+        data = self._request_json("POST", url, json_body={"expiresIn": 3600})
+        signed = str((data or {}).get("signedURL", "")).strip()
+        if not signed:
+            raise RuntimeError(f"signedURL missing in response: {data}")
+        return f"{supabase_url}/storage/v1{signed}"
+
+    def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        timeout, retry, headers = self._http_request_options()
+        last_error: Exception | None = None
+        status_code = 0
+        content_type = ""
+
+        for attempt in range(1, retry + 1):
+            try:
+                with self._get_http_session().request(
+                    method="GET",
+                    url=signed_url,
+                    headers=headers,
+                    timeout=timeout,
+                    stream=True,
+                ) as response:
+                    status_code = response.status_code
+                    content_type = str(response.headers.get("content-type", ""))
+                    if status_code >= 500 and attempt < retry:
+                        logger.warning(
+                            "pdf download retry due to status=%s attempt=%s/%s url=%s",
+                            status_code,
+                            attempt,
+                            retry,
+                            signed_url,
+                        )
+                        self._backoff_sleep(attempt)
+                        continue
+                    if status_code >= 400:
+                        body_preview = response.text[:300]
+                        raise RuntimeError(
+                            f"http error {status_code} for {signed_url}; body={body_preview}",
+                        )
+                    if "application/pdf" not in content_type.lower():
+                        logger.warning(
+                            "pdf content-type is not application/pdf: %s (will validate header)",
+                            content_type,
+                        )
+
+                    with target_path.open("wb") as fp:
+                        for chunk in response.iter_content(chunk_size=1024 * 64):
+                            if chunk:
+                                fp.write(chunk)
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < retry:
+                    logger.warning(
+                        "pdf download retry due to exception attempt=%s/%s url=%s err=%s",
+                        attempt,
+                        retry,
+                        signed_url,
+                        exc,
+                    )
+                    self._backoff_sleep(attempt)
+                    continue
+                break
+
+        if (not target_path.exists()) or target_path.stat().st_size <= 0:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("downloaded pdf file missing")
+
+        with target_path.open("rb") as fp:
+            header = fp.read(5)
+        if header != b"%PDF-":
+            raise RuntimeError("downloaded file is not a valid PDF")
+
+        return status_code, content_type
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        timeout, retry, headers = self._http_request_options()
+        last_error: Exception | None = None
+        for attempt in range(1, retry + 1):
+            try:
+                with self._get_http_session().request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_body,
+                    headers=headers,
+                    timeout=timeout,
+                    stream=False,
+                ) as response:
+                    if response.status_code >= 500 and attempt < retry:
+                        logger.warning(
+                            "http retrying due to status=%s attempt=%s/%s url=%s",
+                            response.status_code,
+                            attempt,
+                            retry,
+                            url,
+                        )
+                        self._backoff_sleep(attempt)
+                        continue
+                    if response.status_code >= 400:
+                        body_preview = response.text[:300]
+                        raise RuntimeError(
+                            f"http error {response.status_code} for {url}; body={body_preview}",
+                        )
+                    try:
+                        return response.json()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"json decode failed: {exc}; body={response.text[:300]}",
+                        ) from exc
+            except Exception as exc:
+                last_error = exc
+                if attempt < retry:
+                    logger.warning(
+                        "http retrying due to exception attempt=%s/%s url=%s err=%s",
+                        attempt,
+                        retry,
+                        url,
+                        exc,
+                    )
+                    self._backoff_sleep(attempt)
+                    continue
+                break
+
+        assert last_error is not None
+        raise last_error
+
+    def _http_request_options(self) -> tuple[int, int, dict[str, str]]:
+        timeout = self._cfg_int("http_timeout_sec", 20, min_value=5)
+        retry = self._cfg_int("http_retry", 3, min_value=1)
+        headers = self._build_supabase_headers()
+        return timeout, retry, headers
+
+    def _backoff_sleep(self, attempt: int) -> None:
+        delay = min(2 ** (attempt - 1), 8)
+        time.sleep(delay)
+
+    def _get_http_session(self) -> requests.Session:
+        session = getattr(self._thread_local, "http_session", None)
+        if session is not None:
+            return session
+
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        self._thread_local.http_session = session
+        with self._session_registry_lock:
+            self._session_registry.append(session)
+        return session
+
+    def _build_supabase_headers(self) -> dict[str, str]:
+        key = self._get_supabase_key()
+        return {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }

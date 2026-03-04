@@ -32,6 +32,12 @@
     "type": "int",
     "default": 170
   },
+  "pdf_max_size_mb": {
+    "description": "允许处理的 PDF 最大体积（MB）",
+    "type": "int",
+    "default": 50,
+    "hint": "超过此大小将拒绝处理，避免异常大文件占用过多内存"
+  },
   "http_timeout_sec": {
     "description": "HTTP 请求超时（秒）",
     "type": "int",
