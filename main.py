@@ -198,7 +198,7 @@ class ShitJournalDailyPlugin(Star):
         **kwargs: Any,
     ):
         """抓取最新论文并推送到当前群聊（按群冷却）"""
-        # Keep a broad signature for compatibility with different AstrBot command injectors.
+        # 兼容 AstrBot 不同注入路径下的命令参数形态。
         normalized = self._normalize_command_event(
             event=event,
             args=args,
@@ -538,7 +538,7 @@ class ShitJournalDailyPlugin(Star):
                 if not pending_targets:
                     report["status"] = "skipped"
                     report["reason_code"] = "ALREADY_DELIVERED"
-                    if str(last_seen_map.get(zone, "")).strip() != paper_id:
+                    if last_seen_map.get(zone) != paper_id:
                         last_seen_map[zone] = paper_id
                         await self.put_kv_data("last_seen_by_zone", last_seen_map)
                     return report
@@ -771,38 +771,36 @@ class ShitJournalDailyPlugin(Star):
         kwargs: dict[str, Any],
         default_action: str,
     ) -> tuple[str, str]:
-        positional_action = args[0] if len(args) >= 1 else None
-        positional_arg = args[1] if len(args) >= 2 else None
+        positional_action: Any = args[0] if len(args) >= 1 else None
+        positional_arg: Any = args[1] if len(args) >= 2 else None
         positional_extra: Any = list(args[2:]) if len(args) >= 3 else None
+        default_action_normalized = default_action.strip().lower()
 
-        action_value = self._pick_command_value(
+        action_tokens = self._pick_command_tokens(
             kwargs=kwargs,
             primary_key="action",
             alias_key="_action",
             positional_value=positional_action,
         )
-        arg_value = self._pick_command_value(
+        arg_tokens = self._pick_command_tokens(
             kwargs=kwargs,
             primary_key="arg",
             alias_key="_arg",
             positional_value=positional_arg,
         )
-        extra_value = self._pick_command_value(
+        extra_tokens = self._pick_command_tokens(
             kwargs=kwargs,
             primary_key="extra_args",
             alias_key="_extra_args",
             positional_value=positional_extra,
         )
 
-        action_tokens = self._split_command_tokens(action_value)
-        action = action_tokens[0] if action_tokens else default_action.strip().lower()
-        action = action or default_action.strip().lower()
-        arg_tokens = action_tokens[1:]
-        arg_tokens.extend(self._split_command_tokens(arg_value))
-        arg_tokens.extend(self._split_command_tokens(extra_value))
-        if action == default_action.strip().lower() and arg_tokens:
-            action = arg_tokens.pop(0)
-        arg_text = " ".join(arg_tokens).strip()
+        action = action_tokens[0] if action_tokens else default_action_normalized
+        action = action or default_action_normalized
+        merged_arg_tokens = action_tokens[1:] + arg_tokens + extra_tokens
+        if action == default_action_normalized and merged_arg_tokens:
+            action = merged_arg_tokens.pop(0)
+        arg_text = " ".join(merged_arg_tokens).strip()
         return action, arg_text
 
     def _parse_action_arg_from_message(
@@ -839,20 +837,22 @@ class ShitJournalDailyPlugin(Star):
 
         return "", ""
 
-    def _pick_command_value(
+    def _pick_command_tokens(
         self,
         kwargs: dict[str, Any],
         primary_key: str,
         alias_key: str,
         positional_value: Any,
-    ) -> Any:
-        primary_value = kwargs.get(primary_key)
-        if primary_key in kwargs and self._has_command_value(primary_value):
-            return primary_value
-        alias_value = kwargs.get(alias_key)
-        if alias_key in kwargs and self._has_command_value(alias_value):
-            return alias_value
-        return positional_value
+    ) -> list[str]:
+        if primary_key in kwargs:
+            tokens = self._split_command_tokens(kwargs.get(primary_key))
+            if tokens:
+                return tokens
+        if alias_key in kwargs:
+            tokens = self._split_command_tokens(kwargs.get(alias_key))
+            if tokens:
+                return tokens
+        return self._split_command_tokens(positional_value)
 
     def _split_command_tokens(self, value: Any) -> list[str]:
         if value is None:
@@ -867,9 +867,6 @@ class ShitJournalDailyPlugin(Star):
         if not text:
             return []
         return [part for part in text.split() if part]
-
-    def _has_command_value(self, value: Any) -> bool:
-        return bool(self._split_command_tokens(value))
 
     def _cfg(self, key: str, default: Any) -> Any:
         try:
@@ -956,7 +953,12 @@ class ShitJournalDailyPlugin(Star):
     def _normalize_session_list(self, raw: Any) -> list[str]:
         if not isinstance(raw, list):
             return []
-        return [str(item).strip() for item in raw if str(item).strip()]
+        normalized: list[str] = []
+        for item in raw:
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized
 
     def _merge_sessions(self, first: list[str], second: list[str]) -> list[str]:
         merged: list[str] = []
@@ -998,7 +1000,7 @@ class ShitJournalDailyPlugin(Star):
         if history_map:
             return history_map
 
-        # Backward compatibility: migrate single-value map on first read.
+        # 向后兼容：首次读取时把旧版单值结构迁移为列表结构。
         legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
         legacy_map = self._clean_kv_dict(legacy_raw)
         return {key: [paper_id] for key, paper_id in legacy_map.items()}
@@ -1035,7 +1037,7 @@ class ShitJournalDailyPlugin(Star):
             history_map[key] = history[:CHI_SHI_SENT_HISTORY_KEEP]
             await self.put_kv_data("chi_shi_sent_history_by_group_zone", history_map)
 
-            # Keep legacy key for compatibility with old data readers.
+            # 保留旧键，兼容仍在读取旧结构的数据。
             legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
             legacy_map = self._clean_kv_dict(legacy_raw)
             legacy_map[key] = paper_id
@@ -1092,7 +1094,7 @@ class ShitJournalDailyPlugin(Star):
         pending_targets: list[str] = []
         for session in targets:
             key = self._target_zone_key(zone, session)
-            if str(last_sent_target_map.get(key, "")).strip() != paper_id:
+            if last_sent_target_map.get(key) != paper_id:
                 pending_targets.append(session)
         return pending_targets
 
@@ -1118,7 +1120,7 @@ class ShitJournalDailyPlugin(Star):
             return False
         for session in targets:
             key = self._target_zone_key(zone, session)
-            if str(last_sent_target_map.get(key, "")).strip() != paper_id:
+            if last_sent_target_map.get(key) != paper_id:
                 return False
         return True
 
