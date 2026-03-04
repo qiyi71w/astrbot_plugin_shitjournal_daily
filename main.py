@@ -102,7 +102,8 @@ class ShitJournalDailyPlugin(Star):
         event: AstrMessageEvent,
         action: str = "help",
         arg: str = "",
-        *extra_args: str,
+        extra_args: Any = None,
+        **_kwargs: Any,
     ):
         """管理 shitjournal 每日推送：bind/unbind/targets/run/run force"""
         if not await self._check_command_permission(event):
@@ -110,7 +111,16 @@ class ShitJournalDailyPlugin(Star):
 
         action = (action or "help").strip().lower()
         arg_parts = [str(arg or "").strip().lower()]
-        arg_parts.extend(str(part).strip().lower() for part in extra_args if str(part).strip())
+        normalized_extra: list[str] = []
+        if isinstance(extra_args, (list, tuple)):
+            normalized_extra = [str(part).strip().lower() for part in extra_args if str(part).strip()]
+        elif isinstance(extra_args, str):
+            normalized_extra = [part.strip().lower() for part in extra_args.split() if part.strip()]
+        elif extra_args is not None:
+            extra_text = str(extra_args).strip().lower()
+            if extra_text:
+                normalized_extra = [extra_text]
+        arg_parts.extend(normalized_extra)
         arg = " ".join(part for part in arg_parts if part).strip()
 
         if action == "bind":
