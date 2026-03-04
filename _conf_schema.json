@@ -1,0 +1,75 @@
+{
+  "zone": {
+    "description": "目标分区",
+    "type": "string",
+    "default": "septic",
+    "hint": "通常使用 septic"
+  },
+  "schedule_times": {
+    "description": "每日定时触发时间",
+    "type": "list",
+    "default": ["09:00", "21:00"],
+    "hint": "支持多个 HH:MM，按本插件时区生效"
+  },
+  "timezone": {
+    "description": "定时任务时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "target_sessions": {
+    "description": "推送目标会话列表",
+    "type": "list",
+    "default": [],
+    "hint": "填写 unified_msg_origin，例如 aiocqhttp:GroupMessage:123456"
+  },
+  "send_pdf": {
+    "description": "是否附带 PDF 文件",
+    "type": "bool",
+    "default": false
+  },
+  "pdf_dpi": {
+    "description": "PDF 第1页转图 DPI",
+    "type": "int",
+    "default": 170
+  },
+  "http_timeout_sec": {
+    "description": "HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "http_retry": {
+    "description": "HTTP 请求重试次数",
+    "type": "int",
+    "default": 3
+  },
+  "temp_keep_files": {
+    "description": "临时文件最多保留数量",
+    "type": "int",
+    "default": 30
+  },
+  "supabase_url": {
+    "description": "Supabase API 地址",
+    "type": "string",
+    "default": "https://bcgdqepzakcufaadgnda.supabase.co"
+  },
+  "supabase_publishable_key": {
+    "description": "Supabase Publishable Key",
+    "type": "string",
+    "default": "sb_publishable_wHqWLjQwO2lMwkGLeBktng_Mk_xf5xd"
+  },
+  "supabase_bucket": {
+    "description": "PDF 所在 Supabase Bucket",
+    "type": "string",
+    "default": "manuscripts"
+  },
+  "command_admin_only": {
+    "description": "仅管理员可使用插件指令",
+    "type": "bool",
+    "default": true
+  },
+  "command_no_permission_reply": {
+    "description": "权限不足时是否提示",
+    "type": "bool",
+    "default": true
+  }
+}
