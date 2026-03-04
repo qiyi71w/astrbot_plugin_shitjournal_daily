@@ -185,6 +185,9 @@ class ShitJournalDailyPlugin(Star):
     async def wo_yao_chi_shi(
         self,
         event: AstrMessageEvent,
+        _action: str = "",
+        _arg: str = "",
+        _extra_args: Any = None,
         *_args: Any,
         **_kwargs: Any,
     ):
