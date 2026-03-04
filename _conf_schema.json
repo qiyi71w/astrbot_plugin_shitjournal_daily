@@ -55,7 +55,8 @@
   "supabase_publishable_key": {
     "description": "Supabase Publishable Key",
     "type": "string",
-    "default": "sb_publishable_wHqWLjQwO2lMwkGLeBktng_Mk_xf5xd"
+    "default": "sb_publishable_wHqWLjQwO2lMwkGLeBktng_Mk_xf5xd",
+    "hint": "默认值可用；也可在配置中覆盖，或通过环境变量 SUPABASE_PUBLISHABLE_KEY 提供"
   },
   "supabase_bucket": {
     "description": "PDF 所在 Supabase Bucket",
@@ -71,5 +72,11 @@
     "description": "权限不足时是否提示",
     "type": "bool",
     "default": true
+  },
+  "chi_shi_group_cooldown_sec": {
+    "description": "“/我要赤石”群聊冷却时间（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "按群聊独立计时，不同群互不影响"
   }
 }

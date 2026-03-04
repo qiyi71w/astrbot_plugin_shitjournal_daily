@@ -18,6 +18,7 @@
 - `/shitjournal targets`：查看当前目标列表
 - `/shitjournal run`：手动执行一次抓取并推送
 - `/shitjournal run force`：忽略去重强制推送
+- `/我要赤石`：抓取最新论文并推送到当前群聊（默认所有人可用）
 
 ## 配置
 配置项定义在 `_conf_schema.json`，常用项如下：
@@ -27,8 +28,11 @@
 - `target_sessions`：会话列表（UMO）
 - `send_pdf`：是否附 PDF，默认 `false`
 - `pdf_dpi`：转图 DPI，默认 `170`
+- `supabase_url`：Supabase API 地址
+- `supabase_publishable_key`：Supabase Publishable Key（已内置默认值，可覆盖；也可用环境变量 `SUPABASE_PUBLISHABLE_KEY`）
 - `command_admin_only`：仅管理员可用命令，默认 `true`
 - `command_no_permission_reply`：无权限是否提示，默认 `true`
+- `chi_shi_group_cooldown_sec`：`/我要赤石` 群聊冷却秒数，默认 `60`（不同群独立计时）
 
 ## 依赖
 `requirements.txt`:
@@ -37,3 +41,6 @@
 
 ## 说明
 - 管理员身份依赖 AstrBot 全局 `admins_id` 配置。
+- 仅“命令”受 `command_admin_only` 控制，定时任务不受影响。
+- 内置了默认 Supabase key；若需要可在插件配置或环境变量中覆盖。
+- `/我要赤石` 不受 `command_admin_only` 影响，默认所有人都可触发。
