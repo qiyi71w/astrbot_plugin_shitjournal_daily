@@ -107,6 +107,16 @@ class ShitJournalDailyPlugin(Star):
         **kwargs: Any,
     ):
         """管理 shitjournal 每日推送：bind/unbind/targets/run/run force"""
+        normalized = self._normalize_command_event(
+            event=event,
+            args=args,
+            kwargs=kwargs,
+            command_name="shitjournal",
+        )
+        if not normalized:
+            return
+        event, args, kwargs = normalized
+
         if not await self._check_command_permission(event):
             return
 
@@ -182,7 +192,16 @@ class ShitJournalDailyPlugin(Star):
     ):
         """抓取最新论文并推送到当前群聊（按群冷却）"""
         # Keep a broad signature for compatibility with different AstrBot command injectors.
-        _ = (args, kwargs)
+        normalized = self._normalize_command_event(
+            event=event,
+            args=args,
+            kwargs=kwargs,
+            command_name="我要赤石",
+        )
+        if not normalized:
+            return
+        event, _, _ = normalized
+
         if not event.get_group_id():
             yield event.plain_result("该指令仅支持群聊。")
             return
@@ -246,14 +265,97 @@ class ShitJournalDailyPlugin(Star):
                 logger.warning("trim temp files failed after chi_shi command", exc_info=True)
 
     async def _check_command_permission(self, event: AstrMessageEvent) -> bool:
+        if not self._looks_like_message_event(event):
+            logger.error(
+                "command permission check failed: invalid event type=%s",
+                type(event).__name__,
+            )
+            return False
+
         if not self._cfg_bool("command_admin_only", True):
             return True
-        if event.is_admin():
+        is_admin = getattr(event, "is_admin", None)
+        if callable(is_admin) and is_admin():
+            return True
+        if self._is_sender_in_admins(event):
             return True
         if self._cfg_bool("command_no_permission_reply", True):
             await event.send(event.plain_result("权限不足：仅管理员可使用该指令。"))
         event.stop_event()
         return False
+
+    def _normalize_command_event(
+        self,
+        event: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        command_name: str,
+    ) -> tuple[AstrMessageEvent, tuple[Any, ...], dict[str, Any]] | None:
+        if self._looks_like_message_event(event):
+            return event, args, kwargs
+
+        candidate = kwargs.get("event")
+        if self._looks_like_message_event(candidate):
+            cleaned_kwargs = dict(kwargs)
+            cleaned_kwargs.pop("event", None)
+            logger.warning(
+                "command %s normalized shifted event from kwargs (type=%s).",
+                command_name,
+                type(event).__name__,
+            )
+            return candidate, args, cleaned_kwargs
+
+        for idx, item in enumerate(args):
+            if self._looks_like_message_event(item):
+                shifted_args = args[:idx] + args[idx + 1 :]
+                logger.warning(
+                    "command %s normalized shifted event from args[%d] (type=%s).",
+                    command_name,
+                    idx,
+                    type(event).__name__,
+                )
+                return item, shifted_args, kwargs
+
+        logger.error(
+            "command %s event normalization failed: event_type=%s args_types=%s kwargs_keys=%s",
+            command_name,
+            type(event).__name__,
+            [type(item).__name__ for item in args[:4]],
+            list(kwargs.keys())[:8],
+        )
+        return None
+
+    def _looks_like_message_event(self, value: Any) -> bool:
+        if isinstance(value, AstrMessageEvent):
+            return True
+        return (
+            value is not None
+            and hasattr(value, "plain_result")
+            and hasattr(value, "send")
+            and hasattr(value, "stop_event")
+            and hasattr(value, "unified_msg_origin")
+            and callable(getattr(value, "get_sender_id", None))
+        )
+
+    def _is_sender_in_admins(self, event: AstrMessageEvent) -> bool:
+        sender_id = str(event.get_sender_id()).strip()
+        if not sender_id:
+            return False
+
+        config_obj: Any = getattr(self.context, "astrbot_config", None)
+        if not isinstance(config_obj, dict):
+            return False
+
+        admins_raw = config_obj.get("admins_id", [])
+        if isinstance(admins_raw, str):
+            normalized_admins = [part.strip() for part in admins_raw.split(",")]
+        elif isinstance(admins_raw, (list, tuple, set)):
+            normalized_admins = [str(part).strip() for part in admins_raw]
+        else:
+            normalized_admins = []
+
+        admins = {item for item in normalized_admins if item}
+        return sender_id in admins
 
     async def _try_enter_chi_shi_cooldown(
         self,
