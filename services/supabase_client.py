@@ -139,7 +139,7 @@ class SupabaseClient:
                         await self._backoff_sleep(attempt)
                         continue
                     if status_code >= 400:
-                        body_preview = (await response.aread())[:300].decode("utf-8", errors="replace")
+                        body_preview = await self._read_response_preview(response)
                         logger.warning(
                             "pdf download http error: status=%s url=%s body=%s",
                             status_code,
@@ -185,6 +185,26 @@ class SupabaseClient:
             raise RuntimeError("downloaded file is not a valid PDF")
 
         return status_code, content_type
+
+    async def _read_response_preview(
+        self,
+        response: httpx.Response,
+        *,
+        max_bytes: int = 1024,
+        chunk_size: int = 256,
+        preview_chars: int = 300,
+    ) -> str:
+        preview = bytearray()
+        async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+            if not chunk:
+                continue
+            remaining = max_bytes - len(preview)
+            if remaining <= 0:
+                break
+            preview.extend(chunk[:remaining])
+            if len(preview) >= max_bytes:
+                break
+        return bytes(preview[:preview_chars]).decode("utf-8", errors="replace")
 
     async def _request_json(
         self,
