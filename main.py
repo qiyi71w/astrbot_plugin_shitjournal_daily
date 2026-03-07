@@ -31,8 +31,7 @@ DEFAULT_SUPABASE_BUCKET = "manuscripts"
 DEFAULT_ZONE = "septic"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
-CHI_SHI_FETCH_CANDIDATE_LIMIT = 5
-CHI_SHI_SENT_HISTORY_KEEP = 30
+CHI_SHI_FETCH_PAGE_SIZE = 20
 SUPABASE_KEY_ENV_NAME = "SUPABASE_PUBLISHABLE_KEY"
 DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "interdisciplinary": ("交叉", "Interdisciplinary"),
@@ -612,35 +611,37 @@ class ShitJournalDailyPlugin(Star):
         session_key: str,
     ) -> tuple[tuple[str, dict[str, Any]] | None, bool]:
         saw_candidates = False
+        history_map = await self._get_chi_shi_sent_history_snapshot()
         for index, zone in enumerate(zone_order):
             is_primary = index == 0
-            try:
-                candidates = await asyncio.to_thread(
-                    self._supabase.fetch_latest_submissions,
-                    zone,
-                    CHI_SHI_FETCH_CANDIDATE_LIMIT,
-                )
-            except Exception:
-                if is_primary:
-                    raise
-                logger.warning(
-                    "fetch chi_shi fallback candidates failed: zone=%s",
-                    zone,
-                    exc_info=True,
-                )
-                continue
+            key = self._chi_shi_group_zone_key(zone, session_key)
+            sent_set = set(history_map.get(key, []))
+            offset = 0
 
-            if not candidates:
-                continue
+            while True:
+                try:
+                    candidates = await asyncio.to_thread(
+                        self._supabase.fetch_latest_submissions,
+                        zone,
+                        CHI_SHI_FETCH_PAGE_SIZE,
+                        offset,
+                    )
+                except Exception as exc:
+                    if is_primary:
+                        raise
+                    raise RuntimeError(f"fetch chi_shi fallback candidates failed: zone={zone}") from exc
 
-            saw_candidates = True
-            candidate = await self._pick_chi_shi_candidate(
-                zone=zone,
-                session_key=session_key,
-                candidates=candidates,
-            )
-            if candidate:
-                return (zone, candidate), True
+                if not candidates:
+                    break
+
+                saw_candidates = True
+                candidate = self._pick_first_unsent_candidate(candidates, sent_set)
+                if candidate:
+                    return (zone, candidate), True
+
+                if len(candidates) < CHI_SHI_FETCH_PAGE_SIZE:
+                    break
+                offset += len(candidates)
 
         return None, saw_candidates
 
@@ -654,16 +655,16 @@ class ShitJournalDailyPlugin(Star):
     ) -> tuple[dict[str, Any] | None, bool, bool]:
         saw_submission = False
         last_seen_dirty = False
+        latest_results = await self._prefetch_latest_submissions(zone_order)
 
-        for index, zone in enumerate(zone_order):
+        for index, (zone, latest_result) in enumerate(zip(zone_order, latest_results)):
             is_primary = index == 0
-            try:
-                latest = await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
-            except Exception as exc:
+            if isinstance(latest_result, BaseException):
+                exc = latest_result
                 if is_primary:
                     raise RuntimeError(str(exc)) from exc
-                logger.warning("fetch latest fallback failed: zone=%s", zone, exc_info=True)
-                continue
+                raise RuntimeError(f"fetch latest fallback failed: zone={zone}") from exc
+            latest = latest_result
 
             if not latest:
                 continue
@@ -676,12 +677,7 @@ class ShitJournalDailyPlugin(Star):
             if not paper_id:
                 if is_primary:
                     raise RuntimeError("EMPTY_PAPER_ID")
-                logger.warning(
-                    "skip fallback zone with empty paper id: zone=%s payload=%s",
-                    zone,
-                    json.dumps(self._build_meta_preview(latest), ensure_ascii=False),
-                )
-                continue
+                raise RuntimeError(f"empty paper id in fallback zone: zone={zone}")
 
             pending_targets = self._filter_pending_targets(
                 zone=zone,
@@ -710,13 +706,29 @@ class ShitJournalDailyPlugin(Star):
         latest: dict[str, Any],
         paper_id: str,
     ) -> dict[str, Any]:
+        payload = dict(latest)
+        if str(payload.get("pdf_path") or payload.get("file_path") or "").strip():
+            return payload
+
         try:
             detail = await asyncio.to_thread(self._supabase.fetch_submission_detail, paper_id)
         except Exception:
             logger.warning("fetch detail failed, fallback to latest payload", exc_info=True)
             detail = {}
-        payload = {**latest, **(detail or {})}
+        payload = {**payload, **(detail or {})}
         return payload
+
+    async def _prefetch_latest_submissions(
+        self,
+        zone_order: list[str],
+    ) -> list[dict[str, Any] | BaseException | None]:
+        async def _fetch_one(zone: str) -> dict[str, Any] | BaseException | None:
+            try:
+                return await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
+            except Exception as exc:
+                return exc
+
+        return await asyncio.gather(*[_fetch_one(zone) for zone in zone_order])
 
     async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path]:
         pdf_key = str(payload.get("pdf_path") or payload.get("file_path") or "").strip()
@@ -1140,26 +1152,35 @@ class ShitJournalDailyPlugin(Star):
 
     async def _get_chi_shi_sent_history_map(self) -> dict[str, list[str]]:
         raw = await self.get_kv_data("chi_shi_sent_history_by_group_zone", {})
-        history_map = self._clean_kv_list_dict(raw)
+        history_map = {
+            key: self._apply_chi_shi_history_policy(history)
+            for key, history in self._clean_kv_list_dict(raw).items()
+        }
+        history_map = {key: history for key, history in history_map.items() if history}
         if history_map:
             return history_map
 
         # 向后兼容：首次读取时把旧版单值结构迁移为列表结构。
         legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
         legacy_map = self._clean_kv_dict(legacy_raw)
-        return {key: [paper_id] for key, paper_id in legacy_map.items()}
+        return {
+            key: history
+            for key, history in (
+                (key, self._apply_chi_shi_history_policy([paper_id]))
+                for key, paper_id in legacy_map.items()
+            )
+            if history
+        }
 
-    async def _pick_chi_shi_candidate(
-        self,
-        zone: str,
-        session_key: str,
-        candidates: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        key = self._chi_shi_group_zone_key(zone, session_key)
+    async def _get_chi_shi_sent_history_snapshot(self) -> dict[str, list[str]]:
         async with self._chi_shi_dedupe_lock:
-            history_map = await self._get_chi_shi_sent_history_map()
-            sent_set = set(history_map.get(key, []))
+            return await self._get_chi_shi_sent_history_map()
 
+    def _pick_first_unsent_candidate(
+        self,
+        candidates: list[dict[str, Any]],
+        sent_set: set[str],
+    ) -> dict[str, Any] | None:
         for candidate in candidates:
             paper_id = str(candidate.get("id", "")).strip()
             if paper_id and paper_id not in sent_set:
@@ -1178,7 +1199,7 @@ class ShitJournalDailyPlugin(Star):
             history = history_map.get(key, [])
             history = [item for item in history if item != paper_id]
             history.insert(0, paper_id)
-            history_map[key] = history[:CHI_SHI_SENT_HISTORY_KEEP]
+            history_map[key] = self._apply_chi_shi_history_policy(history)
             await self.put_kv_data("chi_shi_sent_history_by_group_zone", history_map)
 
             # 保留旧键，兼容仍在读取旧结构的数据。
@@ -1186,6 +1207,13 @@ class ShitJournalDailyPlugin(Star):
             legacy_map = self._clean_kv_dict(legacy_raw)
             legacy_map[key] = paper_id
             await self.put_kv_data("chi_shi_last_sent_by_group_zone", legacy_map)
+
+    def _apply_chi_shi_history_policy(self, history: list[str]) -> list[str]:
+        if self._cfg_bool("chi_shi_keep_full_history", True):
+            return history
+
+        limit = self._cfg_int("chi_shi_history_limit", 30, min_value=1)
+        return history[:limit]
 
     def _clean_kv_dict(self, raw: Any) -> dict[str, str]:
         if not isinstance(raw, dict):

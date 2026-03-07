@@ -107,5 +107,16 @@
     "type": "int",
     "default": 10,
     "hint": "抓取失败后仍施加短冷却，避免重试风暴"
+  },
+  "chi_shi_keep_full_history": {
+    "description": "“/我要赤石”是否全量保留已推送历史",
+    "type": "bool",
+    "default": true
+  },
+  "chi_shi_history_limit": {
+    "description": "“/我要赤石”已推送历史保留上限",
+    "type": "int",
+    "default": 30,
+    "hint": "仅在关闭全量保留时生效；按群聊和分区分别计数，保留最近 N 条"
   }
 }
