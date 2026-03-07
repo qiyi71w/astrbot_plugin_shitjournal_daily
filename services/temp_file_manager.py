@@ -47,19 +47,36 @@ class TempFileManager:
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         async with self._temp_files_lock:
             active_keys = set(self._active_temp_files)
-            files = [p for p in self._temp_dir.iterdir() if p.is_file()]
-            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        files: list[tuple[float, Path]] = []
+        for file_path in self._temp_dir.iterdir():
+            if not file_path.is_file():
+                continue
+            try:
+                files.append((file_path.stat().st_mtime, file_path))
+            except FileNotFoundError:
+                continue
+        files.sort(key=lambda item: item[0], reverse=True)
 
-            kept_inactive = 0
-            for file_path in files:
-                file_key = self._temp_file_key(file_path)
-                if file_key in active_keys:
-                    continue
-                if kept_inactive < keep:
-                    kept_inactive += 1
+        delete_candidates: list[Path] = []
+        kept_inactive = 0
+        for _, file_path in files:
+            file_key = self._temp_file_key(file_path)
+            if file_key in active_keys:
+                continue
+            if kept_inactive < keep:
+                kept_inactive += 1
+                continue
+            delete_candidates.append(file_path)
+
+        for file_path in delete_candidates:
+            file_key = self._temp_file_key(file_path)
+            async with self._temp_files_lock:
+                if file_key in self._active_temp_files:
                     continue
                 try:
                     file_path.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    continue
                 except Exception:
                     logger.warning("failed to delete temp file: %s", str(file_path), exc_info=True)
 

@@ -12,6 +12,10 @@ from astrbot.api import logger
 from .sensitive import mask_sensitive_text
 
 
+class _NonRetryableRequestError(RuntimeError):
+    pass
+
+
 class SupabaseClient:
     def __init__(
         self,
@@ -106,13 +110,13 @@ class SupabaseClient:
         if not signed:
             logger.error("signedURL missing in response: url=%s", self._mask_url(url))
             raise RuntimeError("signedURL missing in response")
-        return f"{supabase_url}/storage/v1{signed}"
+        return self._resolve_signed_url(supabase_url, signed)
 
     async def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
         signed_url = self._validate_signed_url(signed_url)
         safe_url = self._mask_url(signed_url)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        timeout, retry, headers = self._http_request_options()
+        timeout, retry, _ = self._http_request_options()
         client = await self._get_http_client()
         last_error: Exception | None = None
         status_code = 0
@@ -123,7 +127,8 @@ class SupabaseClient:
                 async with client.stream(
                     method="GET",
                     url=signed_url,
-                    headers=headers,
+                    headers=self._build_download_headers(),
+                    follow_redirects=True,
                     timeout=timeout,
                 ) as response:
                     status_code = response.status_code
@@ -146,7 +151,7 @@ class SupabaseClient:
                             safe_url,
                             body_preview,
                         )
-                        raise RuntimeError(
+                        raise _NonRetryableRequestError(
                             f"http error {status_code} while downloading pdf",
                         )
                     if "application/pdf" not in content_type.lower():
@@ -155,13 +160,27 @@ class SupabaseClient:
                             content_type,
                         )
 
+                    header_preview = bytearray()
                     async with aiofiles.open(target_path, "wb") as fp:
                         async for chunk in response.aiter_bytes(chunk_size=1024 * 64):
-                            if chunk:
-                                await fp.write(chunk)
+                            if not chunk:
+                                continue
+                            if len(header_preview) < 5:
+                                missing = 5 - len(header_preview)
+                                header_preview.extend(chunk[:missing])
+                                if len(header_preview) >= 5 and bytes(header_preview[:5]) != b"%PDF-":
+                                    raise _NonRetryableRequestError(
+                                        "downloaded file is not a valid PDF",
+                                    )
+                            await fp.write(chunk)
+                    if bytes(header_preview[:5]) != b"%PDF-":
+                        raise _NonRetryableRequestError("downloaded file is not a valid PDF")
                 break
             except Exception as exc:
                 last_error = exc
+                self._remove_partial_file(target_path)
+                if isinstance(exc, _NonRetryableRequestError):
+                    break
                 if attempt < retry:
                     logger.warning(
                         "pdf download retry due to exception attempt=%s/%s url=%s err=%s",
@@ -178,11 +197,6 @@ class SupabaseClient:
             if last_error is not None:
                 raise last_error
             raise RuntimeError("downloaded pdf file missing")
-
-        with target_path.open("rb") as fp:
-            header = fp.read(5)
-        if header != b"%PDF-":
-            raise RuntimeError("downloaded file is not a valid PDF")
 
         return status_code, content_type
 
@@ -204,7 +218,7 @@ class SupabaseClient:
             preview.extend(chunk[:remaining])
             if len(preview) >= max_bytes:
                 break
-        return bytes(preview[:preview_chars]).decode("utf-8", errors="replace")
+        return self._decode_preview_bytes(preview, max_bytes=max_bytes, preview_chars=preview_chars)
 
     async def _request_json(
         self,
@@ -225,8 +239,18 @@ class SupabaseClient:
                     params=params,
                     json=json_body,
                     headers=headers,
+                    follow_redirects=False,
                     timeout=timeout,
                 )
+                if 300 <= response.status_code < 400:
+                    location = self._mask_url(str(response.headers.get("location", "")).strip())
+                    logger.warning(
+                        "supabase request redirect blocked: status=%s url=%s location=%s",
+                        response.status_code,
+                        safe_url,
+                        location or "<missing>",
+                    )
+                    raise _NonRetryableRequestError("unexpected redirect for supabase request")
                 if response.status_code >= 500 and attempt < retry:
                     logger.warning(
                         "http retrying due to status=%s attempt=%s/%s url=%s",
@@ -238,30 +262,32 @@ class SupabaseClient:
                     await self._backoff_sleep(attempt)
                     continue
                 if response.status_code >= 400:
-                    body_preview = response.text[:300]
+                    body_preview = self._decode_preview_bytes(response.content)
                     logger.warning(
                         "supabase request http error: status=%s url=%s body=%s",
                         response.status_code,
                         safe_url,
                         body_preview,
                     )
-                    raise RuntimeError(
+                    raise _NonRetryableRequestError(
                         f"http error {response.status_code} for supabase request",
                     )
                 try:
                     return response.json()
                 except Exception:
-                    body_preview = response.text[:300]
+                    body_preview = self._decode_preview_bytes(response.content)
                     logger.warning(
                         "supabase json decode failed: url=%s body=%s",
                         safe_url,
                         body_preview,
                     )
-                    raise RuntimeError(
+                    raise _NonRetryableRequestError(
                         "json decode failed for supabase response",
                     )
             except Exception as exc:
                 last_error = exc
+                if isinstance(exc, _NonRetryableRequestError):
+                    break
                 if attempt < retry:
                     logger.warning(
                         "http retrying due to exception attempt=%s/%s url=%s err=%s",
@@ -298,7 +324,7 @@ class SupabaseClient:
                 return client
 
             limits = httpx.Limits(max_connections=16, max_keepalive_connections=16)
-            self._client = httpx.AsyncClient(limits=limits, follow_redirects=True)
+            self._client = httpx.AsyncClient(limits=limits, follow_redirects=False)
             return self._client
 
     def _build_supabase_headers(self) -> dict[str, str]:
@@ -309,6 +335,40 @@ class SupabaseClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+
+    def _build_download_headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/pdf",
+        }
+
+    def _decode_preview_bytes(
+        self,
+        data: bytes | bytearray,
+        *,
+        max_bytes: int = 1024,
+        preview_chars: int = 300,
+    ) -> str:
+        preview_bytes = bytes(data[:max_bytes])
+        return mask_sensitive_text(preview_bytes[:preview_chars].decode("utf-8", errors="replace"))
+
+    def _remove_partial_file(self, target_path: Path) -> None:
+        try:
+            target_path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("failed to remove partial download: %s", str(target_path), exc_info=True)
+
+    def _resolve_signed_url(self, supabase_url: str, signed: str) -> str:
+        parsed = urlsplit(signed)
+        if parsed.scheme and parsed.netloc:
+            return signed
+        base = str(supabase_url).rstrip("/")
+        if signed.startswith("/storage/v1/"):
+            return f"{base}{signed}"
+        if signed.startswith("/"):
+            return f"{base}/storage/v1{signed}"
+        if signed.startswith("storage/v1/"):
+            return f"{base}/{signed}"
+        return f"{base}/storage/v1/{signed.lstrip('/')}"
 
     def _validate_signed_url(self, signed_url: str) -> str:
         parsed = urlsplit(str(signed_url).strip())
