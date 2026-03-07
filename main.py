@@ -47,6 +47,12 @@ VISCOSITY_LABELS: dict[str, tuple[str, str]] = {
     "semi": ("半固态", "Semi-solid"),
     "high-entropy": ("高熵态", "High-Entropy"),
 }
+ZONE_LABELS: dict[str, tuple[str, str]] = {
+    "latrine": ("旱厕", "The Latrine"),
+    "septic": ("化粪池", "Septic Tank"),
+    "stone": ("构石", "The Stone"),
+    "sediment": ("沉淀区", "Sediment"),
+}
 
 
 @register(
@@ -97,7 +103,7 @@ class ShitJournalDailyPlugin(Star):
 
     async def terminate(self):
         await self._clear_cron_jobs()
-        self._supabase.close()
+        await self._supabase.close()
         logger.info("shitjournal_daily terminated.")
 
     @filter.command("shitjournal")
@@ -250,7 +256,7 @@ class ShitJournalDailyPlugin(Star):
             payload = await self._load_submission_payload(candidate, paper_id)
             detail_url = f"https://shitjournal.org/preprints/{paper_id}"
             pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
-            text = self._build_push_text(payload, detail_url)
+            text = self._build_push_text(payload, detail_url, zone=zone)
             chain = self._build_push_chain(text, png_file, pdf_file)
             await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
             yield chain
@@ -290,6 +296,7 @@ class ShitJournalDailyPlugin(Star):
         event.stop_event()
         return False
 
+    # 命令兼容层：处理 AstrBot 在不同注入路径下 event/action 参数位置不一致的情况。
     def _normalize_command_event(
         self,
         event: Any,
@@ -559,7 +566,7 @@ class ShitJournalDailyPlugin(Star):
                     report["debug_reason"] = mask_sensitive_text(str(exc))
                     return report
 
-                text = self._build_push_text(payload, detail_url)
+                text = self._build_push_text(payload, detail_url, zone=zone)
                 sent_ok, sent_success_targets = await self._send_push_to_targets(
                     targets=pending_targets,
                     text=text,
@@ -620,8 +627,7 @@ class ShitJournalDailyPlugin(Star):
 
             while True:
                 try:
-                    candidates = await asyncio.to_thread(
-                        self._supabase.fetch_latest_submissions,
+                    candidates = await self._supabase.fetch_latest_submissions(
                         zone,
                         CHI_SHI_FETCH_PAGE_SIZE,
                         offset,
@@ -726,7 +732,7 @@ class ShitJournalDailyPlugin(Star):
             return payload
 
         try:
-            detail = await asyncio.to_thread(self._supabase.fetch_submission_detail, paper_id)
+            detail = await self._supabase.fetch_submission_detail(paper_id)
         except Exception:
             logger.warning("fetch detail failed, fallback to latest payload", exc_info=True)
             detail = {}
@@ -739,7 +745,7 @@ class ShitJournalDailyPlugin(Star):
     ) -> list[dict[str, Any] | BaseException | None]:
         async def _fetch_one(zone: str) -> dict[str, Any] | BaseException | None:
             try:
-                return await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
+                return await self._supabase.fetch_latest_submission(zone)
             except Exception as exc:
                 return exc
 
@@ -751,7 +757,7 @@ class ShitJournalDailyPlugin(Star):
             raise RuntimeError("pdf path missing")
 
         try:
-            signed_url = await asyncio.to_thread(self._supabase.create_signed_pdf_url, pdf_key)
+            signed_url = await self._supabase.create_signed_pdf_url(pdf_key)
         except Exception as exc:
             logger.error(
                 "create signed url failed: %s",
@@ -769,8 +775,7 @@ class ShitJournalDailyPlugin(Star):
 
         try:
             try:
-                pdf_status, pdf_type = await asyncio.to_thread(
-                    self._supabase.download_pdf_file,
+                pdf_status, pdf_type = await self._supabase.download_pdf_file(
                     signed_url,
                     pdf_file,
                 )
@@ -853,10 +858,11 @@ class ShitJournalDailyPlugin(Star):
             chain.chain.append(File(name=pdf_file.name, file=str(pdf_file)))
         return chain
 
-    def _build_push_text(self, payload: dict[str, Any], detail_url: str) -> str:
+    def _build_push_text(self, payload: dict[str, Any], detail_url: str, zone: str = "") -> str:
         title = self._fallback_text(payload.get("manuscript_title"))
         author = self._fallback_text(payload.get("author_name"))
         institution = self._fallback_text(payload.get("institution"))
+        zone_text = self._format_bilingual_label(zone or payload.get("zone"), ZONE_LABELS)
         submitted = self._format_datetime(payload.get("created_at"))
         discipline = self._format_bilingual_label(payload.get("discipline"), DISCIPLINE_LABELS)
         viscosity = self._format_bilingual_label(payload.get("viscosity"), VISCOSITY_LABELS)
@@ -866,6 +872,7 @@ class ShitJournalDailyPlugin(Star):
 
         return (
             "S.H.I.T Journal 最新论文推送\n"
+            f"分区: {zone_text}\n"
             f"标题: {title}\n"
             f"作者: {author}\n"
             f"单位: {institution}\n"
