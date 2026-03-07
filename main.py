@@ -225,25 +225,23 @@ class ShitJournalDailyPlugin(Star):
         pdf_file: Path | None = None
         png_file: Path | None = None
         try:
-            zone = str(self._cfg("zone", DEFAULT_ZONE)).strip() or DEFAULT_ZONE
-            candidates = await asyncio.to_thread(
-                self._supabase.fetch_latest_submissions,
-                zone,
-                CHI_SHI_FETCH_CANDIDATE_LIMIT,
+            primary_zone = self._get_primary_zone()
+            zone_order = self._get_candidate_zones(primary_zone)
+            selected, saw_candidates = await self._select_chi_shi_candidate_from_zones(
+                zone_order=zone_order,
+                session_key=session_key,
             )
-            if not candidates:
+            if not selected:
+                if saw_candidates:
+                    success = True
+                    yield event.plain_result(
+                        f"本群{self._build_zone_scope_text(zone_order)}最近这些论文都推送过了，等下一篇。",
+                    )
+                    return
                 yield event.plain_result("未找到最新论文。")
                 return
 
-            candidate = await self._pick_chi_shi_candidate(
-                zone=zone,
-                session_key=session_key,
-                candidates=candidates,
-            )
-            if not candidate:
-                success = True
-                yield event.plain_result("本群最近这些论文都推送过了，等下一篇。")
-                return
+            zone, candidate = selected
 
             paper_id = str(candidate.get("id", "")).strip()
             if not paper_id:
@@ -473,13 +471,15 @@ class ShitJournalDailyPlugin(Star):
             }
 
         async with self._run_lock:
-            zone = str(self._cfg("zone", DEFAULT_ZONE)).strip() or DEFAULT_ZONE
+            primary_zone = self._get_primary_zone()
+            zone_order = self._get_candidate_zones(primary_zone)
             pdf_file: Path | None = None
             png_file: Path | None = None
             report: dict[str, Any] = {
                 "status": "failed",
                 "source": source,
-                "zone": zone,
+                "zone": primary_zone,
+                "requested_zone": primary_zone,
                 "force": force,
                 "paper_id": "",
                 "detail_url": "",
@@ -488,62 +488,65 @@ class ShitJournalDailyPlugin(Star):
                 "reason_code": "",
                 "debug_reason": "",
             }
-            logger.info("run start: source=%s zone=%s force=%s", source, zone, force)
+            logger.info(
+                "run start: source=%s primary_zone=%s zone_order=%s force=%s",
+                source,
+                primary_zone,
+                zone_order,
+                force,
+            )
             try:
-                try:
-                    latest = await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
-                except Exception as exc:
-                    logger.error(
-                        "fetch latest failed: %s",
-                        mask_sensitive_text(str(exc)),
-                        exc_info=True,
-                    )
-                    report["reason_code"] = "FETCH_LATEST_FAILED"
-                    report["debug_reason"] = mask_sensitive_text(str(exc))
-                    return report
-
-                if not latest:
-                    report["reason_code"] = "LATEST_NOT_FOUND"
-                    return report
-
-                paper_id = str(latest.get("id", "")).strip()
-                detail_url = f"https://shitjournal.org/preprints/{paper_id}" if paper_id else ""
-                report["paper_id"] = paper_id
-                report["detail_url"] = detail_url
-                logger.info("latest paper fetched: id=%s detail_url=%s", paper_id, detail_url)
-
-                if not paper_id:
-                    report["reason_code"] = "EMPTY_PAPER_ID"
-                    return report
-
                 targets = await self._get_all_target_sessions()
                 if not targets:
                     report["reason_code"] = "NO_TARGET_SESSION_CONFIGURED"
                     return report
+
+                last_seen_map = await self._get_last_seen_map()
+                last_sent_target_map = await self._get_last_sent_target_map()
+                try:
+                    selected, saw_submission, last_seen_dirty = await self._select_run_candidate(
+                        zone_order=zone_order,
+                        targets=targets,
+                        last_seen_map=last_seen_map,
+                        last_sent_target_map=last_sent_target_map,
+                        force=force,
+                    )
+                except RuntimeError as exc:
+                    message = str(exc).strip()
+                    if message == "EMPTY_PAPER_ID":
+                        report["reason_code"] = "EMPTY_PAPER_ID"
+                        return report
+                    logger.error(
+                        "fetch latest failed: %s",
+                        mask_sensitive_text(message),
+                        exc_info=True,
+                    )
+                    report["reason_code"] = "FETCH_LATEST_FAILED"
+                    report["debug_reason"] = mask_sensitive_text(message)
+                    return report
+
+                if not selected:
+                    report["status"] = "skipped"
+                    report["reason_code"] = "ALREADY_DELIVERED" if saw_submission else "LATEST_NOT_FOUND"
+                    if last_seen_dirty:
+                        await self.put_kv_data("last_seen_by_zone", last_seen_map)
+                    return report
+
+                zone = str(selected["zone"])
+                latest = dict(selected["latest"])
+                paper_id = str(selected["paper_id"])
+                detail_url = str(selected["detail_url"])
+                pending_targets = list(selected["pending_targets"])
+                report["zone"] = zone
+                report["paper_id"] = paper_id
+                report["detail_url"] = detail_url
+                report["sent_total"] = len(pending_targets)
 
                 payload = await self._load_submission_payload(latest, paper_id)
                 logger.info(
                     "submission metadata: %s",
                     json.dumps(self._build_meta_preview(payload), ensure_ascii=False),
                 )
-
-                last_seen_map = await self._get_last_seen_map()
-                last_sent_target_map = await self._get_last_sent_target_map()
-                pending_targets = self._filter_pending_targets(
-                    zone=zone,
-                    paper_id=paper_id,
-                    targets=targets,
-                    last_sent_target_map=last_sent_target_map,
-                    force=force,
-                )
-                report["sent_total"] = len(pending_targets)
-                if not pending_targets:
-                    report["status"] = "skipped"
-                    report["reason_code"] = "ALREADY_DELIVERED"
-                    if last_seen_map.get(zone) != paper_id:
-                        last_seen_map[zone] = paper_id
-                        await self.put_kv_data("last_seen_by_zone", last_seen_map)
-                    return report
 
                 try:
                     pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
@@ -582,6 +585,7 @@ class ShitJournalDailyPlugin(Star):
                 )
                 if all_delivered:
                     last_seen_map[zone] = paper_id
+                if all_delivered or last_seen_dirty:
                     await self.put_kv_data("last_seen_by_zone", last_seen_map)
 
                 if sent_ok == len(pending_targets):
@@ -601,6 +605,105 @@ class ShitJournalDailyPlugin(Star):
                     await self._temp_files.trim()
                 except Exception:
                     logger.warning("trim temp files failed after run_cycle", exc_info=True)
+
+    async def _select_chi_shi_candidate_from_zones(
+        self,
+        zone_order: list[str],
+        session_key: str,
+    ) -> tuple[tuple[str, dict[str, Any]] | None, bool]:
+        saw_candidates = False
+        for index, zone in enumerate(zone_order):
+            is_primary = index == 0
+            try:
+                candidates = await asyncio.to_thread(
+                    self._supabase.fetch_latest_submissions,
+                    zone,
+                    CHI_SHI_FETCH_CANDIDATE_LIMIT,
+                )
+            except Exception:
+                if is_primary:
+                    raise
+                logger.warning(
+                    "fetch chi_shi fallback candidates failed: zone=%s",
+                    zone,
+                    exc_info=True,
+                )
+                continue
+
+            if not candidates:
+                continue
+
+            saw_candidates = True
+            candidate = await self._pick_chi_shi_candidate(
+                zone=zone,
+                session_key=session_key,
+                candidates=candidates,
+            )
+            if candidate:
+                return (zone, candidate), True
+
+        return None, saw_candidates
+
+    async def _select_run_candidate(
+        self,
+        zone_order: list[str],
+        targets: list[str],
+        last_seen_map: dict[str, str],
+        last_sent_target_map: dict[str, str],
+        force: bool,
+    ) -> tuple[dict[str, Any] | None, bool, bool]:
+        saw_submission = False
+        last_seen_dirty = False
+
+        for index, zone in enumerate(zone_order):
+            is_primary = index == 0
+            try:
+                latest = await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
+            except Exception as exc:
+                if is_primary:
+                    raise RuntimeError(str(exc)) from exc
+                logger.warning("fetch latest fallback failed: zone=%s", zone, exc_info=True)
+                continue
+
+            if not latest:
+                continue
+
+            saw_submission = True
+            paper_id = str(latest.get("id", "")).strip()
+            detail_url = f"https://shitjournal.org/preprints/{paper_id}" if paper_id else ""
+            logger.info("latest paper fetched: zone=%s id=%s detail_url=%s", zone, paper_id, detail_url)
+
+            if not paper_id:
+                if is_primary:
+                    raise RuntimeError("EMPTY_PAPER_ID")
+                logger.warning(
+                    "skip fallback zone with empty paper id: zone=%s payload=%s",
+                    zone,
+                    json.dumps(self._build_meta_preview(latest), ensure_ascii=False),
+                )
+                continue
+
+            pending_targets = self._filter_pending_targets(
+                zone=zone,
+                paper_id=paper_id,
+                targets=targets,
+                last_sent_target_map=last_sent_target_map,
+                force=force,
+            )
+            if pending_targets:
+                return {
+                    "zone": zone,
+                    "latest": latest,
+                    "paper_id": paper_id,
+                    "detail_url": detail_url,
+                    "pending_targets": pending_targets,
+                }, saw_submission, last_seen_dirty
+
+            if last_seen_map.get(zone) != paper_id:
+                last_seen_map[zone] = paper_id
+                last_seen_dirty = True
+
+        return None, saw_submission, last_seen_dirty
 
     async def _load_submission_payload(
         self,
@@ -918,6 +1021,45 @@ class ShitJournalDailyPlugin(Star):
             value = min(max_value, value)
         return value
 
+    def _get_primary_zone(self) -> str:
+        zone = str(self._cfg("zone", DEFAULT_ZONE)).strip()
+        return zone or DEFAULT_ZONE
+
+    def _normalize_zone_list(self, raw: Any) -> list[str]:
+        if isinstance(raw, str):
+            values = [item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()]
+        elif isinstance(raw, list):
+            values = [str(item).strip() for item in raw if str(item).strip()]
+        else:
+            values = []
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    def _get_candidate_zones(self, primary_zone: str) -> list[str]:
+        zones = [primary_zone]
+        if not self._cfg_bool("enable_zone_fallback", False):
+            return zones
+
+        seen = {primary_zone}
+        for zone in self._normalize_zone_list(self._cfg("fallback_zones", [])):
+            if zone in seen:
+                continue
+            seen.add(zone)
+            zones.append(zone)
+        return zones
+
+    def _build_zone_scope_text(self, zone_order: list[str]) -> str:
+        if len(zone_order) > 1:
+            return "目标分区和候补分区"
+        return "目标分区"
+
     def _parse_hhmm(self, value: str) -> tuple[int, int] | None:
         text = str(value).strip()
         match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", text)
@@ -1190,16 +1332,21 @@ class ShitJournalDailyPlugin(Star):
         reason_code = str(report.get("reason_code") or report.get("reason") or "UNKNOWN")
         debug_reason = mask_sensitive_text(str(report.get("debug_reason", "")).strip())
         paper_id = report.get("paper_id", "")
+        zone = str(report.get("zone", "")).strip()
+        requested_zone = str(report.get("requested_zone", "")).strip()
         sent_ok = report.get("sent_ok", 0)
         sent_total = report.get("sent_total", 0)
         detail_url = report.get("detail_url", "")
         text = (
             f"[shitjournal run] status={status}\n"
             f"reason={reason_code}\n"
+            f"zone={zone}\n"
             f"paper_id={paper_id}\n"
             f"send={sent_ok}/{sent_total}\n"
             f"url={detail_url}"
         )
+        if requested_zone and requested_zone != zone:
+            text += f"\nrequested_zone={requested_zone}"
         if include_debug and debug_reason:
             text += f"\ndebug_reason={debug_reason}"
         return text
