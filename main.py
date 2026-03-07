@@ -32,7 +32,11 @@ DEFAULT_ZONE = "stone"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
 CHI_SHI_FETCH_PAGE_SIZE = 20
+CHI_SHI_HISTORY_STORAGE_VERSION = "2"
+CHI_SHI_HISTORY_STORAGE_VERSION_KEY = "chi_shi_sent_history_storage_version"
+CHI_SHI_HISTORY_KV_PREFIX = "chi_shi_sent_history_v2::"
 SUPABASE_KEY_ENV_NAME = "SUPABASE_PUBLISHABLE_KEY"
+TEMP_TRIM_INTERVAL_SEC = 60
 DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "interdisciplinary": ("交叉", "Interdisciplinary"),
     "science": ("理", "Science"),
@@ -66,12 +70,15 @@ class ShitJournalDailyPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._run_lock = asyncio.Lock()
+        self._bound_sessions_lock = asyncio.Lock()
         self._cron_job_ids: list[str] = []
         self._chi_shi_cooldown_lock = asyncio.Lock()
         self._chi_shi_dedupe_lock = asyncio.Lock()
         self._chi_shi_group_cooldown_until_monotonic: dict[str, float] = {}
         self._chi_shi_group_inflight: set[str] = set()
-        self._chi_shi_legacy_history_enabled: bool | None = None
+        self._chi_shi_history_storage_ready = False
+        self._temp_trim_lock = asyncio.Lock()
+        self._next_temp_trim_monotonic = 0.0
         self._plugin_data_dir = Path(".")
         self._temp_dir = Path(".")
         self._send_concurrency = 3
@@ -97,9 +104,10 @@ class ShitJournalDailyPlugin(Star):
             max_value=MAX_SEND_CONCURRENCY,
         )
         self._temp_dir.mkdir(parents=True, exist_ok=True)
+        await self._ensure_chi_shi_history_storage_ready()
         await self._clear_cron_jobs()
         await self._register_cron_jobs()
-        await self._temp_files.trim()
+        await self._maybe_trim_temp_files(force=True)
         logger.info("shitjournal_daily initialized.")
 
     async def terminate(self):
@@ -142,24 +150,18 @@ class ShitJournalDailyPlugin(Star):
             arg = fallback_arg
 
         if action == "bind":
-            bound = await self._get_bound_sessions()
             current = event.unified_msg_origin
-            if current in bound:
+            if not await self._bind_session(current):
                 yield event.plain_result(f"当前会话已绑定：{current}")
                 return
-            bound.append(current)
-            await self._set_bound_sessions(bound)
             yield event.plain_result(f"绑定成功：{current}")
             return
 
         if action == "unbind":
-            bound = await self._get_bound_sessions()
             current = event.unified_msg_origin
-            if current not in bound:
+            if not await self._unbind_session(current):
                 yield event.plain_result(f"当前会话未绑定：{current}")
                 return
-            bound = [s for s in bound if s != current]
-            await self._set_bound_sessions(bound)
             yield event.plain_result(f"解绑成功：{current}")
             return
 
@@ -273,7 +275,7 @@ class ShitJournalDailyPlugin(Star):
             await self._leave_chi_shi_cooldown(session_key=session_key, success=success)
             await self._temp_files.release(pdf_file, png_file)
             try:
-                await self._temp_files.trim()
+                await self._maybe_trim_temp_files()
             except Exception:
                 logger.warning("trim temp files failed after chi_shi command", exc_info=True)
 
@@ -609,7 +611,7 @@ class ShitJournalDailyPlugin(Star):
             finally:
                 await self._temp_files.release(pdf_file, png_file)
                 try:
-                    await self._temp_files.trim()
+                    await self._maybe_trim_temp_files()
                 except Exception:
                     logger.warning("trim temp files failed after run_cycle", exc_info=True)
 
@@ -619,11 +621,9 @@ class ShitJournalDailyPlugin(Star):
         session_key: str,
     ) -> tuple[tuple[str, dict[str, Any]] | None, bool]:
         saw_candidates = False
-        history_map = await self._get_chi_shi_sent_history_snapshot()
         for index, zone in enumerate(zone_order):
             is_primary = index == 0
-            key = self._chi_shi_group_zone_key(zone, session_key)
-            sent_set = set(history_map.get(key, []))
+            sent_set = set(await self._get_chi_shi_sent_history(zone, session_key))
             offset = 0
 
             while True:
@@ -1162,6 +1162,24 @@ class ShitJournalDailyPlugin(Star):
         normalized = self._normalize_session_list(sessions)
         await self.put_kv_data("bound_sessions", normalized)
 
+    async def _bind_session(self, session: str) -> bool:
+        async with self._bound_sessions_lock:
+            bound = await self._get_bound_sessions()
+            if session in bound:
+                return False
+            bound.append(session)
+            await self._set_bound_sessions(bound)
+            return True
+
+    async def _unbind_session(self, session: str) -> bool:
+        async with self._bound_sessions_lock:
+            bound = await self._get_bound_sessions()
+            if session not in bound:
+                return False
+            updated = [item for item in bound if item != session]
+            await self._set_bound_sessions(updated)
+            return True
+
     async def _get_all_target_sessions(self) -> list[str]:
         cfg_targets = self._normalize_session_list(self._cfg("target_sessions", []))
         bound = await self._get_bound_sessions()
@@ -1178,31 +1196,72 @@ class ShitJournalDailyPlugin(Star):
     def _chi_shi_group_zone_key(self, zone: str, session: str) -> str:
         return f"{self._normalize_zone_name(zone)}::{session}"
 
-    async def _get_chi_shi_sent_history_map(self) -> dict[str, list[str]]:
-        raw = await self.get_kv_data("chi_shi_sent_history_by_group_zone", {})
-        history_map = {
-            key: self._apply_chi_shi_history_policy(history)
-            for key, history in self._clean_kv_list_dict(raw).items()
-        }
-        history_map = {key: history for key, history in history_map.items() if history}
-        if history_map:
-            return history_map
+    def _chi_shi_history_store_key(self, zone: str, session: str) -> str:
+        return f"{CHI_SHI_HISTORY_KV_PREFIX}{self._chi_shi_group_zone_key(zone, session)}"
 
-        # 向后兼容：首次读取时把旧版单值结构迁移为列表结构。
-        legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
-        legacy_map = self._clean_kv_dict(legacy_raw)
-        return {
-            key: history
-            for key, history in (
-                (key, self._apply_chi_shi_history_policy([paper_id]))
-                for key, paper_id in legacy_map.items()
-            )
-            if history
-        }
+    def _normalize_group_zone_key(self, raw_key: Any) -> str:
+        text = str(raw_key or "").strip()
+        if not text:
+            return ""
+        zone, sep, session = text.partition("::")
+        if not sep:
+            return ""
+        session = session.strip()
+        if not session:
+            return ""
+        return self._chi_shi_group_zone_key(zone, session)
 
-    async def _get_chi_shi_sent_history_snapshot(self) -> dict[str, list[str]]:
+    async def _ensure_chi_shi_history_storage_ready(self) -> None:
+        if self._chi_shi_history_storage_ready:
+            return
         async with self._chi_shi_dedupe_lock:
-            return await self._get_chi_shi_sent_history_map()
+            if self._chi_shi_history_storage_ready:
+                return
+
+            version = str(await self.get_kv_data(CHI_SHI_HISTORY_STORAGE_VERSION_KEY, "") or "").strip()
+            if version == CHI_SHI_HISTORY_STORAGE_VERSION:
+                self._chi_shi_history_storage_ready = True
+                return
+
+            merged = await self._load_legacy_chi_shi_histories()
+            for group_zone_key, history in merged.items():
+                zone, _, session = group_zone_key.partition("::")
+                if not session:
+                    continue
+                await self.put_kv_data(self._chi_shi_history_store_key(zone, session), history)
+            await self.put_kv_data(CHI_SHI_HISTORY_STORAGE_VERSION_KEY, CHI_SHI_HISTORY_STORAGE_VERSION)
+            self._chi_shi_history_storage_ready = True
+
+    async def _load_legacy_chi_shi_histories(self) -> dict[str, list[str]]:
+        history_raw = await self.get_kv_data("chi_shi_sent_history_by_group_zone", {})
+        legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
+
+        merged: dict[str, list[str]] = {}
+        for raw_key, history in self._clean_kv_list_dict(history_raw).items():
+            key = self._normalize_group_zone_key(raw_key)
+            if not key:
+                continue
+            merged[key] = self._apply_chi_shi_history_policy(history)
+
+        for raw_key, paper_id in self._clean_kv_dict(legacy_raw).items():
+            key = self._normalize_group_zone_key(raw_key)
+            if not key:
+                continue
+            history = merged.get(key, [])
+            if paper_id not in history:
+                history = history + [paper_id]
+            merged[key] = self._apply_chi_shi_history_policy(history)
+
+        return {key: history for key, history in merged.items() if history}
+
+    async def _get_chi_shi_sent_history(self, zone: str, session: str) -> list[str]:
+        await self._ensure_chi_shi_history_storage_ready()
+        async with self._chi_shi_dedupe_lock:
+            return await self._get_chi_shi_sent_history_unlocked(zone, session)
+
+    async def _get_chi_shi_sent_history_unlocked(self, zone: str, session: str) -> list[str]:
+        raw = await self.get_kv_data(self._chi_shi_history_store_key(zone, session), [])
+        return self._apply_chi_shi_history_policy(self._clean_kv_list(raw))
 
     def _pick_first_unsent_candidate(
         self,
@@ -1221,21 +1280,15 @@ class ShitJournalDailyPlugin(Star):
         session: str,
         paper_id: str,
     ) -> None:
-        key = self._chi_shi_group_zone_key(zone, session)
+        await self._ensure_chi_shi_history_storage_ready()
         async with self._chi_shi_dedupe_lock:
-            history_map = await self._get_chi_shi_sent_history_map()
-            history = history_map.get(key, [])
+            history = await self._get_chi_shi_sent_history_unlocked(zone, session)
             history = [item for item in history if item != paper_id]
             history.insert(0, paper_id)
-            history_map[key] = self._apply_chi_shi_history_policy(history)
-            await self.put_kv_data("chi_shi_sent_history_by_group_zone", history_map)
-
-            if await self._should_sync_legacy_chi_shi_history():
-                # 仅在确有旧结构数据时回写，避免每次都做额外整表读写。
-                legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
-                legacy_map = self._clean_kv_dict(legacy_raw)
-                legacy_map[key] = paper_id
-                await self.put_kv_data("chi_shi_last_sent_by_group_zone", legacy_map)
+            await self.put_kv_data(
+                self._chi_shi_history_store_key(zone, session),
+                self._apply_chi_shi_history_policy(history),
+            )
 
     def _apply_chi_shi_history_policy(self, history: list[str]) -> list[str]:
         if self._cfg_bool("chi_shi_keep_full_history", True):
@@ -1254,6 +1307,18 @@ class ShitJournalDailyPlugin(Star):
             if key_s and val_s:
                 result[key_s] = val_s
         return result
+
+    def _clean_kv_list(self, raw: Any) -> list[str]:
+        values = raw if isinstance(raw, list) else [raw]
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            item_s = str(item).strip()
+            if not item_s or item_s in seen:
+                continue
+            seen.add(item_s)
+            cleaned.append(item_s)
+        return cleaned
 
     def _clean_kv_list_dict(self, raw: Any) -> dict[str, list[str]]:
         if not isinstance(raw, dict):
@@ -1282,12 +1347,19 @@ class ShitJournalDailyPlugin(Star):
     def _target_zone_key(self, zone: str, session: str) -> str:
         return f"{self._normalize_zone_name(zone)}::{session}"
 
-    async def _should_sync_legacy_chi_shi_history(self) -> bool:
-        if self._chi_shi_legacy_history_enabled is not None:
-            return self._chi_shi_legacy_history_enabled
-        legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", None)
-        self._chi_shi_legacy_history_enabled = isinstance(legacy_raw, dict)
-        return self._chi_shi_legacy_history_enabled
+    async def _maybe_trim_temp_files(self, *, force: bool = False) -> None:
+        async with self._temp_trim_lock:
+            now = time.monotonic()
+            if (not force) and now < self._next_temp_trim_monotonic:
+                return
+            self._next_temp_trim_monotonic = now + TEMP_TRIM_INTERVAL_SEC
+
+        try:
+            await self._temp_files.trim()
+        except Exception:
+            async with self._temp_trim_lock:
+                self._next_temp_trim_monotonic = 0.0
+            raise
 
     def _filter_pending_targets(
         self,
