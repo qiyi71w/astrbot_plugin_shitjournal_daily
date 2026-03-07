@@ -23,7 +23,7 @@
 
 ## 配置
 配置项定义在 `_conf_schema.json`，常用项如下：
-- `zone`：默认 `septic`
+- `zone`：默认 `stone`
 - `enable_zone_fallback`：目标分区没有可推送新稿时，是否尝试候补分区，默认 `false`
 - `fallback_zones`：候补分区列表，按填写顺序尝试，默认 `["septic"]`
 - `schedule_times`：默认 `["09:00","21:00"]`
@@ -39,6 +39,8 @@
 - `command_no_permission_reply`：无权限是否提示，默认 `true`
 - `chi_shi_group_cooldown_sec`：`/我要赤石` 群聊冷却秒数，默认 `60`（不同群独立计时）
 - `chi_shi_group_fail_cooldown_sec`：`/我要赤石` 失败后冷却秒数，默认 `10`
+- `chi_shi_keep_full_history`：`/我要赤石` 是否全量保留已推送历史，默认 `true`
+- `chi_shi_history_limit`：`/我要赤石` 已推送历史保留上限，默认 `30`，仅在关闭全量保留时生效
 
 ## 依赖
 `requirements.txt`:
@@ -51,3 +53,4 @@
 - 内置了默认 Supabase key；若需要可在插件配置或环境变量中覆盖。
 - `/我要赤石` 不受 `command_admin_only` 影响，默认所有人都可触发。
 - 开启 `enable_zone_fallback` 后，定时推送、`/shitjournal run` 和 `/我要赤石` 都会先尝试 `zone`，只有当前分区最近没有可推送论文时才依次尝试 `fallback_zones`。
+- `chi_shi_keep_full_history=true` 时会完整保留每个群、每个分区的已推送历史；关闭后仅保留最近 `chi_shi_history_limit` 条，更省存储，但更早的论文后续会被视为“未推送”。

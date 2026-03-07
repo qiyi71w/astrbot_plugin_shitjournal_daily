@@ -47,8 +47,14 @@ class SupabaseClient:
             return None
         return latest_list[0]
 
-    def fetch_latest_submissions(self, zone: str, limit: int) -> list[dict[str, Any]]:
+    def fetch_latest_submissions(
+        self,
+        zone: str,
+        limit: int,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 20))
+        safe_offset = max(0, int(offset))
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
         select_fields = (
             "id,manuscript_title,author_name,institution,viscosity,discipline,"
@@ -59,6 +65,7 @@ class SupabaseClient:
             "select": select_fields,
             "zone": f"eq.{zone}",
             "limit": str(safe_limit),
+            "offset": str(safe_offset),
         }
         if zone == "septic":
             params["order"] = "promoted_to_septic_at.desc.nullslast"
