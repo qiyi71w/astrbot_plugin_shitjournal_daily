@@ -629,7 +629,12 @@ class ShitJournalDailyPlugin(Star):
                 except Exception as exc:
                     if is_primary:
                         raise
-                    raise RuntimeError(f"fetch chi_shi fallback candidates failed: zone={zone}") from exc
+                    logger.warning(
+                        "fetch chi_shi fallback candidates failed: zone=%s",
+                        zone,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                    break
 
                 if not candidates:
                     break
@@ -663,7 +668,12 @@ class ShitJournalDailyPlugin(Star):
                 exc = latest_result
                 if is_primary:
                     raise RuntimeError(str(exc)) from exc
-                raise RuntimeError(f"fetch latest fallback failed: zone={zone}") from exc
+                logger.warning(
+                    "fetch latest fallback failed: zone=%s",
+                    zone,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                continue
             latest = latest_result
 
             if not latest:
@@ -677,7 +687,12 @@ class ShitJournalDailyPlugin(Star):
             if not paper_id:
                 if is_primary:
                     raise RuntimeError("EMPTY_PAPER_ID")
-                raise RuntimeError(f"empty paper id in fallback zone: zone={zone}")
+                logger.warning(
+                    "skip fallback zone with empty paper id: zone=%s payload=%s",
+                    zone,
+                    json.dumps(self._build_meta_preview(latest), ensure_ascii=False),
+                )
+                continue
 
             pending_targets = self._filter_pending_targets(
                 zone=zone,
