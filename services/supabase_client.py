@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import threading
-import time
+import asyncio
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
-import requests
+import aiofiles
+import httpx
 from astrbot.api import logger
-from requests.adapters import HTTPAdapter
 
 from .sensitive import mask_sensitive_text
 
@@ -27,27 +26,29 @@ class SupabaseClient:
         self._get_supabase_key = key_getter
         self._default_url = default_url
         self._default_bucket = default_bucket
-        self._thread_local = threading.local()
-        self._session_registry_lock = threading.Lock()
-        self._session_registry: list[requests.Session] = []
+        self._client: httpx.AsyncClient | None = None
+        self._client_lock = asyncio.Lock()
 
-    def close(self) -> None:
-        with self._session_registry_lock:
-            sessions = self._session_registry[:]
-            self._session_registry.clear()
-        for session in sessions:
-            try:
-                session.close()
-            except Exception:
-                logger.warning("close http session failed", exc_info=True)
+    async def close(self) -> None:
+        async with self._client_lock:
+            client = self._client
+            self._client = None
 
-    def fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
-        latest_list = self.fetch_latest_submissions(zone=zone, limit=1)
+        if client is None:
+            return
+
+        try:
+            await client.aclose()
+        except Exception:
+            logger.warning("close http client failed", exc_info=True)
+
+    async def fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
+        latest_list = await self.fetch_latest_submissions(zone=zone, limit=1)
         if not latest_list:
             return None
         return latest_list[0]
 
-    def fetch_latest_submissions(
+    async def fetch_latest_submissions(
         self,
         zone: str,
         limit: int,
@@ -73,7 +74,7 @@ class SupabaseClient:
             params["order"] = "created_at.desc"
 
         url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
-        data = self._request_json("GET", url, params=params)
+        data = await self._request_json("GET", url, params=params)
         if not isinstance(data, list) or not data:
             return []
         result: list[dict[str, Any]] = []
@@ -82,7 +83,7 @@ class SupabaseClient:
                 result.append(item)
         return result
 
-    def fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
+    async def fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
         url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
         params = {
@@ -90,40 +91,40 @@ class SupabaseClient:
             "id": f"eq.{paper_id}",
             "limit": "1",
         }
-        data = self._request_json("GET", url, params=params)
+        data = await self._request_json("GET", url, params=params)
         if not isinstance(data, list) or not data:
             return {}
         return data[0]
 
-    def create_signed_pdf_url(self, pdf_path: str) -> str:
+    async def create_signed_pdf_url(self, pdf_path: str) -> str:
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
         bucket = str(self._cfg("supabase_bucket", self._default_bucket)).strip()
         escaped = quote(pdf_path, safe="/")
         url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{escaped}"
-        data = self._request_json("POST", url, json_body={"expiresIn": 3600})
+        data = await self._request_json("POST", url, json_body={"expiresIn": 3600})
         signed = str((data or {}).get("signedURL", "")).strip()
         if not signed:
             logger.error("signedURL missing in response: url=%s", self._mask_url(url))
             raise RuntimeError("signedURL missing in response")
         return f"{supabase_url}/storage/v1{signed}"
 
-    def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
+    async def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
         signed_url = self._validate_signed_url(signed_url)
         safe_url = self._mask_url(signed_url)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         timeout, retry, headers = self._http_request_options()
+        client = await self._get_http_client()
         last_error: Exception | None = None
         status_code = 0
         content_type = ""
 
         for attempt in range(1, retry + 1):
             try:
-                with self._get_http_session().request(
+                async with client.stream(
                     method="GET",
                     url=signed_url,
                     headers=headers,
                     timeout=timeout,
-                    stream=True,
                 ) as response:
                     status_code = response.status_code
                     content_type = str(response.headers.get("content-type", ""))
@@ -135,10 +136,10 @@ class SupabaseClient:
                             retry,
                             safe_url,
                         )
-                        self._backoff_sleep(attempt)
+                        await self._backoff_sleep(attempt)
                         continue
                     if status_code >= 400:
-                        body_preview = response.text[:300]
+                        body_preview = (await response.aread())[:300].decode("utf-8", errors="replace")
                         logger.warning(
                             "pdf download http error: status=%s url=%s body=%s",
                             status_code,
@@ -154,10 +155,10 @@ class SupabaseClient:
                             content_type,
                         )
 
-                    with target_path.open("wb") as fp:
-                        for chunk in response.iter_content(chunk_size=1024 * 64):
+                    async with aiofiles.open(target_path, "wb") as fp:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 64):
                             if chunk:
-                                fp.write(chunk)
+                                await fp.write(chunk)
                 break
             except Exception as exc:
                 last_error = exc
@@ -169,7 +170,7 @@ class SupabaseClient:
                         safe_url,
                         mask_sensitive_text(str(exc)),
                     )
-                    self._backoff_sleep(attempt)
+                    await self._backoff_sleep(attempt)
                     continue
                 break
 
@@ -185,7 +186,7 @@ class SupabaseClient:
 
         return status_code, content_type
 
-    def _request_json(
+    async def _request_json(
         self,
         method: str,
         url: str,
@@ -194,51 +195,51 @@ class SupabaseClient:
     ) -> Any:
         safe_url = self._mask_url(url)
         timeout, retry, headers = self._http_request_options()
+        client = await self._get_http_client()
         last_error: Exception | None = None
         for attempt in range(1, retry + 1):
             try:
-                with self._get_http_session().request(
+                response = await client.request(
                     method=method,
                     url=url,
                     params=params,
                     json=json_body,
                     headers=headers,
                     timeout=timeout,
-                    stream=False,
-                ) as response:
-                    if response.status_code >= 500 and attempt < retry:
-                        logger.warning(
-                            "http retrying due to status=%s attempt=%s/%s url=%s",
-                            response.status_code,
-                            attempt,
-                            retry,
-                            safe_url,
-                        )
-                        self._backoff_sleep(attempt)
-                        continue
-                    if response.status_code >= 400:
-                        body_preview = response.text[:300]
-                        logger.warning(
-                            "supabase request http error: status=%s url=%s body=%s",
-                            response.status_code,
-                            safe_url,
-                            body_preview,
-                        )
-                        raise RuntimeError(
-                            f"http error {response.status_code} for supabase request",
-                        )
-                    try:
-                        return response.json()
-                    except Exception:
-                        body_preview = response.text[:300]
-                        logger.warning(
-                            "supabase json decode failed: url=%s body=%s",
-                            safe_url,
-                            body_preview,
-                        )
-                        raise RuntimeError(
-                            "json decode failed for supabase response",
-                        )
+                )
+                if response.status_code >= 500 and attempt < retry:
+                    logger.warning(
+                        "http retrying due to status=%s attempt=%s/%s url=%s",
+                        response.status_code,
+                        attempt,
+                        retry,
+                        safe_url,
+                    )
+                    await self._backoff_sleep(attempt)
+                    continue
+                if response.status_code >= 400:
+                    body_preview = response.text[:300]
+                    logger.warning(
+                        "supabase request http error: status=%s url=%s body=%s",
+                        response.status_code,
+                        safe_url,
+                        body_preview,
+                    )
+                    raise RuntimeError(
+                        f"http error {response.status_code} for supabase request",
+                    )
+                try:
+                    return response.json()
+                except Exception:
+                    body_preview = response.text[:300]
+                    logger.warning(
+                        "supabase json decode failed: url=%s body=%s",
+                        safe_url,
+                        body_preview,
+                    )
+                    raise RuntimeError(
+                        "json decode failed for supabase response",
+                    )
             except Exception as exc:
                 last_error = exc
                 if attempt < retry:
@@ -249,7 +250,7 @@ class SupabaseClient:
                         safe_url,
                         mask_sensitive_text(str(exc)),
                     )
-                    self._backoff_sleep(attempt)
+                    await self._backoff_sleep(attempt)
                     continue
                 break
 
@@ -262,23 +263,23 @@ class SupabaseClient:
         headers = self._build_supabase_headers()
         return timeout, retry, headers
 
-    def _backoff_sleep(self, attempt: int) -> None:
+    async def _backoff_sleep(self, attempt: int) -> None:
         delay = min(2 ** (attempt - 1), 8)
-        time.sleep(delay)
+        await asyncio.sleep(delay)
 
-    def _get_http_session(self) -> requests.Session:
-        session = getattr(self._thread_local, "http_session", None)
-        if session is not None:
-            return session
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        client = self._client
+        if client is not None:
+            return client
 
-        session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        self._thread_local.http_session = session
-        with self._session_registry_lock:
-            self._session_registry.append(session)
-        return session
+        async with self._client_lock:
+            client = self._client
+            if client is not None:
+                return client
+
+            limits = httpx.Limits(max_connections=16, max_keepalive_connections=16)
+            self._client = httpx.AsyncClient(limits=limits, follow_redirects=True)
+            return self._client
 
     def _build_supabase_headers(self) -> dict[str, str]:
         key = self._get_supabase_key()

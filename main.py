@@ -97,7 +97,7 @@ class ShitJournalDailyPlugin(Star):
 
     async def terminate(self):
         await self._clear_cron_jobs()
-        self._supabase.close()
+        await self._supabase.close()
         logger.info("shitjournal_daily terminated.")
 
     @filter.command("shitjournal")
@@ -290,6 +290,7 @@ class ShitJournalDailyPlugin(Star):
         event.stop_event()
         return False
 
+    # 命令兼容层：处理 AstrBot 在不同注入路径下 event/action 参数位置不一致的情况。
     def _normalize_command_event(
         self,
         event: Any,
@@ -620,8 +621,7 @@ class ShitJournalDailyPlugin(Star):
 
             while True:
                 try:
-                    candidates = await asyncio.to_thread(
-                        self._supabase.fetch_latest_submissions,
+                    candidates = await self._supabase.fetch_latest_submissions(
                         zone,
                         CHI_SHI_FETCH_PAGE_SIZE,
                         offset,
@@ -726,7 +726,7 @@ class ShitJournalDailyPlugin(Star):
             return payload
 
         try:
-            detail = await asyncio.to_thread(self._supabase.fetch_submission_detail, paper_id)
+            detail = await self._supabase.fetch_submission_detail(paper_id)
         except Exception:
             logger.warning("fetch detail failed, fallback to latest payload", exc_info=True)
             detail = {}
@@ -739,7 +739,7 @@ class ShitJournalDailyPlugin(Star):
     ) -> list[dict[str, Any] | BaseException | None]:
         async def _fetch_one(zone: str) -> dict[str, Any] | BaseException | None:
             try:
-                return await asyncio.to_thread(self._supabase.fetch_latest_submission, zone)
+                return await self._supabase.fetch_latest_submission(zone)
             except Exception as exc:
                 return exc
 
@@ -751,7 +751,7 @@ class ShitJournalDailyPlugin(Star):
             raise RuntimeError("pdf path missing")
 
         try:
-            signed_url = await asyncio.to_thread(self._supabase.create_signed_pdf_url, pdf_key)
+            signed_url = await self._supabase.create_signed_pdf_url(pdf_key)
         except Exception as exc:
             logger.error(
                 "create signed url failed: %s",
@@ -769,8 +769,7 @@ class ShitJournalDailyPlugin(Star):
 
         try:
             try:
-                pdf_status, pdf_type = await asyncio.to_thread(
-                    self._supabase.download_pdf_file,
+                pdf_status, pdf_type = await self._supabase.download_pdf_file(
                     signed_url,
                     pdf_file,
                 )
