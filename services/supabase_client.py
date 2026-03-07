@@ -106,13 +106,13 @@ class SupabaseClient:
         if not signed:
             logger.error("signedURL missing in response: url=%s", self._mask_url(url))
             raise RuntimeError("signedURL missing in response")
-        return f"{supabase_url}/storage/v1{signed}"
+        return self._resolve_signed_url(supabase_url, signed)
 
     async def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
         signed_url = self._validate_signed_url(signed_url)
         safe_url = self._mask_url(signed_url)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        timeout, retry, headers = self._http_request_options()
+        timeout, retry, _ = self._http_request_options()
         client = await self._get_http_client()
         last_error: Exception | None = None
         status_code = 0
@@ -123,7 +123,8 @@ class SupabaseClient:
                 async with client.stream(
                     method="GET",
                     url=signed_url,
-                    headers=headers,
+                    headers=self._build_download_headers(),
+                    follow_redirects=True,
                     timeout=timeout,
                 ) as response:
                     status_code = response.status_code
@@ -204,7 +205,7 @@ class SupabaseClient:
             preview.extend(chunk[:remaining])
             if len(preview) >= max_bytes:
                 break
-        return bytes(preview[:preview_chars]).decode("utf-8", errors="replace")
+        return mask_sensitive_text(bytes(preview[:preview_chars]).decode("utf-8", errors="replace"))
 
     async def _request_json(
         self,
@@ -225,8 +226,18 @@ class SupabaseClient:
                     params=params,
                     json=json_body,
                     headers=headers,
+                    follow_redirects=False,
                     timeout=timeout,
                 )
+                if 300 <= response.status_code < 400:
+                    location = self._mask_url(str(response.headers.get("location", "")).strip())
+                    logger.warning(
+                        "supabase request redirect blocked: status=%s url=%s location=%s",
+                        response.status_code,
+                        safe_url,
+                        location or "<missing>",
+                    )
+                    raise RuntimeError("unexpected redirect for supabase request")
                 if response.status_code >= 500 and attempt < retry:
                     logger.warning(
                         "http retrying due to status=%s attempt=%s/%s url=%s",
@@ -238,7 +249,7 @@ class SupabaseClient:
                     await self._backoff_sleep(attempt)
                     continue
                 if response.status_code >= 400:
-                    body_preview = response.text[:300]
+                    body_preview = mask_sensitive_text(response.text[:300])
                     logger.warning(
                         "supabase request http error: status=%s url=%s body=%s",
                         response.status_code,
@@ -251,7 +262,7 @@ class SupabaseClient:
                 try:
                     return response.json()
                 except Exception:
-                    body_preview = response.text[:300]
+                    body_preview = mask_sensitive_text(response.text[:300])
                     logger.warning(
                         "supabase json decode failed: url=%s body=%s",
                         safe_url,
@@ -298,7 +309,7 @@ class SupabaseClient:
                 return client
 
             limits = httpx.Limits(max_connections=16, max_keepalive_connections=16)
-            self._client = httpx.AsyncClient(limits=limits, follow_redirects=True)
+            self._client = httpx.AsyncClient(limits=limits, follow_redirects=False)
             return self._client
 
     def _build_supabase_headers(self) -> dict[str, str]:
@@ -309,6 +320,24 @@ class SupabaseClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+
+    def _build_download_headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/pdf",
+        }
+
+    def _resolve_signed_url(self, supabase_url: str, signed: str) -> str:
+        parsed = urlsplit(signed)
+        if parsed.scheme and parsed.netloc:
+            return signed
+        base = str(supabase_url).rstrip("/")
+        if signed.startswith("/storage/v1/"):
+            return f"{base}{signed}"
+        if signed.startswith("/"):
+            return f"{base}/storage/v1{signed}"
+        if signed.startswith("storage/v1/"):
+            return f"{base}/{signed}"
+        return f"{base}/storage/v1/{signed.lstrip('/')}"
 
     def _validate_signed_url(self, signed_url: str) -> str:
         parsed = urlsplit(str(signed_url).strip())

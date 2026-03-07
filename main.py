@@ -28,7 +28,7 @@ except ImportError:
 
 DEFAULT_SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co"
 DEFAULT_SUPABASE_BUCKET = "manuscripts"
-DEFAULT_ZONE = "septic"
+DEFAULT_ZONE = "stone"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
 CHI_SHI_FETCH_PAGE_SIZE = 20
@@ -71,6 +71,7 @@ class ShitJournalDailyPlugin(Star):
         self._chi_shi_dedupe_lock = asyncio.Lock()
         self._chi_shi_group_cooldown_until_monotonic: dict[str, float] = {}
         self._chi_shi_group_inflight: set[str] = set()
+        self._chi_shi_legacy_history_enabled: bool | None = None
         self._plugin_data_dir = Path(".")
         self._temp_dir = Path(".")
         self._send_concurrency = 3
@@ -1056,20 +1057,25 @@ class ShitJournalDailyPlugin(Star):
         return value
 
     def _get_primary_zone(self) -> str:
-        zone = str(self._cfg("zone", DEFAULT_ZONE)).strip()
+        zone = self._normalize_zone_name(self._cfg("zone", DEFAULT_ZONE))
         return zone or DEFAULT_ZONE
+
+    def _normalize_zone_name(self, value: Any) -> str:
+        return str(value or "").strip().lower()
 
     def _normalize_zone_list(self, raw: Any) -> list[str]:
         if isinstance(raw, str):
-            values = [item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()]
+            values = [self._normalize_zone_name(item) for item in re.split(r"[,\s]+", raw)]
         elif isinstance(raw, list):
-            values = [str(item).strip() for item in raw if str(item).strip()]
+            values = [self._normalize_zone_name(item) for item in raw]
         else:
             values = []
 
         normalized: list[str] = []
         seen: set[str] = set()
         for value in values:
+            if not value:
+                continue
             if value in seen:
                 continue
             seen.add(value)
@@ -1170,7 +1176,7 @@ class ShitJournalDailyPlugin(Star):
         return self._clean_kv_dict(raw)
 
     def _chi_shi_group_zone_key(self, zone: str, session: str) -> str:
-        return f"{zone}::{session}"
+        return f"{self._normalize_zone_name(zone)}::{session}"
 
     async def _get_chi_shi_sent_history_map(self) -> dict[str, list[str]]:
         raw = await self.get_kv_data("chi_shi_sent_history_by_group_zone", {})
@@ -1224,11 +1230,12 @@ class ShitJournalDailyPlugin(Star):
             history_map[key] = self._apply_chi_shi_history_policy(history)
             await self.put_kv_data("chi_shi_sent_history_by_group_zone", history_map)
 
-            # 保留旧键，兼容仍在读取旧结构的数据。
-            legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
-            legacy_map = self._clean_kv_dict(legacy_raw)
-            legacy_map[key] = paper_id
-            await self.put_kv_data("chi_shi_last_sent_by_group_zone", legacy_map)
+            if await self._should_sync_legacy_chi_shi_history():
+                # 仅在确有旧结构数据时回写，避免每次都做额外整表读写。
+                legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", {})
+                legacy_map = self._clean_kv_dict(legacy_raw)
+                legacy_map[key] = paper_id
+                await self.put_kv_data("chi_shi_last_sent_by_group_zone", legacy_map)
 
     def _apply_chi_shi_history_policy(self, history: list[str]) -> list[str]:
         if self._cfg_bool("chi_shi_keep_full_history", True):
@@ -1273,7 +1280,14 @@ class ShitJournalDailyPlugin(Star):
         return result
 
     def _target_zone_key(self, zone: str, session: str) -> str:
-        return f"{zone}::{session}"
+        return f"{self._normalize_zone_name(zone)}::{session}"
+
+    async def _should_sync_legacy_chi_shi_history(self) -> bool:
+        if self._chi_shi_legacy_history_enabled is not None:
+            return self._chi_shi_legacy_history_enabled
+        legacy_raw = await self.get_kv_data("chi_shi_last_sent_by_group_zone", None)
+        self._chi_shi_legacy_history_enabled = isinstance(legacy_raw, dict)
+        return self._chi_shi_legacy_history_enabled
 
     def _filter_pending_targets(
         self,
