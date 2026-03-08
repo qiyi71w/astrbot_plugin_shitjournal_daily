@@ -31,7 +31,11 @@ DEFAULT_SUPABASE_BUCKET = "manuscripts"
 DEFAULT_ZONE = "stone"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
+RUN_FETCH_PAGE_SIZE = 20
 CHI_SHI_FETCH_PAGE_SIZE = 20
+RUN_SENT_HISTORY_STORAGE_VERSION = "2"
+RUN_SENT_HISTORY_STORAGE_VERSION_KEY = "run_sent_history_storage_version"
+RUN_SENT_HISTORY_KV_PREFIX = "run_sent_history_v2::"
 CHI_SHI_HISTORY_STORAGE_VERSION = "2"
 CHI_SHI_HISTORY_STORAGE_VERSION_KEY = "chi_shi_sent_history_storage_version"
 CHI_SHI_HISTORY_KV_PREFIX = "chi_shi_sent_history_v2::"
@@ -72,6 +76,8 @@ class ShitJournalDailyPlugin(Star):
         self._run_lock = asyncio.Lock()
         self._bound_sessions_lock = asyncio.Lock()
         self._cron_job_ids: list[str] = []
+        self._run_sent_history_lock = asyncio.Lock()
+        self._run_sent_history_storage_ready = False
         self._chi_shi_cooldown_lock = asyncio.Lock()
         self._chi_shi_dedupe_lock = asyncio.Lock()
         self._chi_shi_group_cooldown_until_monotonic: dict[str, float] = {}
@@ -511,13 +517,11 @@ class ShitJournalDailyPlugin(Star):
                     return report
 
                 last_seen_map = await self._get_last_seen_map()
-                last_sent_target_map = await self._get_last_sent_target_map()
                 try:
                     selected, saw_submission, last_seen_dirty = await self._select_run_candidate(
                         zone_order=zone_order,
                         targets=targets,
                         last_seen_map=last_seen_map,
-                        last_sent_target_map=last_sent_target_map,
                         force=force,
                     )
                 except RuntimeError as exc:
@@ -546,6 +550,8 @@ class ShitJournalDailyPlugin(Star):
                 paper_id = str(selected["paper_id"])
                 detail_url = str(selected["detail_url"])
                 pending_targets = list(selected["pending_targets"])
+                sent_history_by_target = dict(selected["sent_history_by_target"])
+                sent_history_lookup_by_target = dict(selected["sent_history_lookup_by_target"])
                 report["zone"] = zone
                 report["paper_id"] = paper_id
                 report["detail_url"] = detail_url
@@ -578,19 +584,18 @@ class ShitJournalDailyPlugin(Star):
                 )
                 report["sent_ok"] = sent_ok
                 if sent_success_targets:
-                    self._mark_targets_delivered(
+                    await self._mark_targets_delivered(
                         zone=zone,
                         paper_id=paper_id,
                         success_targets=sent_success_targets,
-                        last_sent_target_map=last_sent_target_map,
+                        sent_history_by_target=sent_history_by_target,
+                        sent_history_lookup_by_target=sent_history_lookup_by_target,
                     )
-                    await self.put_kv_data("last_sent_by_target_zone", last_sent_target_map)
 
                 all_delivered = self._all_targets_delivered(
-                    zone=zone,
                     paper_id=paper_id,
                     targets=targets,
-                    last_sent_target_map=last_sent_target_map,
+                    sent_history_lookup_by_target=sent_history_lookup_by_target,
                 )
                 if all_delivered:
                     last_seen_map[zone] = paper_id
@@ -662,64 +667,92 @@ class ShitJournalDailyPlugin(Star):
         zone_order: list[str],
         targets: list[str],
         last_seen_map: dict[str, str],
-        last_sent_target_map: dict[str, str],
         force: bool,
     ) -> tuple[dict[str, Any] | None, bool, bool]:
         saw_submission = False
         last_seen_dirty = False
-        latest_results = await self._prefetch_latest_submissions(zone_order)
-
-        for index, (zone, latest_result) in enumerate(zip(zone_order, latest_results)):
+        for index, zone in enumerate(zone_order):
             is_primary = index == 0
-            if isinstance(latest_result, BaseException):
-                exc = latest_result
-                if is_primary:
-                    raise RuntimeError(str(exc)) from exc
-                logger.warning(
-                    "fetch latest fallback failed: zone=%s",
-                    zone,
-                    exc_info=(type(exc), exc, exc.__traceback__),
-                )
-                continue
-            latest = latest_result
+            sent_history_by_target = await self._get_run_sent_histories(zone, targets)
+            sent_history_lookup_by_target = self._build_history_lookup(sent_history_by_target)
+            offset = 0
+            zone_latest_recorded = False
 
-            if not latest:
-                continue
+            while True:
+                try:
+                    candidates = await self._supabase.fetch_latest_submissions(
+                        zone,
+                        RUN_FETCH_PAGE_SIZE,
+                        offset,
+                    )
+                except Exception as exc:
+                    if is_primary:
+                        raise RuntimeError(str(exc)) from exc
+                    logger.warning(
+                        "fetch latest fallback failed: zone=%s",
+                        zone,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                    break
 
-            saw_submission = True
-            paper_id = str(latest.get("id", "")).strip()
-            detail_url = f"https://shitjournal.org/preprints/{paper_id}" if paper_id else ""
-            logger.info("latest paper fetched: zone=%s id=%s detail_url=%s", zone, paper_id, detail_url)
+                if not candidates:
+                    break
 
-            if not paper_id:
-                if is_primary:
-                    raise RuntimeError("EMPTY_PAPER_ID")
-                logger.warning(
-                    "skip fallback zone with empty paper id: zone=%s payload=%s",
-                    zone,
-                    json.dumps(self._build_meta_preview(latest), ensure_ascii=False),
-                )
-                continue
+                saw_submission = True
+                skip_zone = False
+                for candidate_index, candidate in enumerate(candidates):
+                    paper_id = str(candidate.get("id", "")).strip()
+                    if not paper_id:
+                        if offset == 0 and candidate_index == 0:
+                            if is_primary:
+                                raise RuntimeError("EMPTY_PAPER_ID")
+                            logger.warning(
+                                "skip fallback zone with empty paper id: zone=%s payload=%s",
+                                zone,
+                                json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
+                            )
+                            skip_zone = True
+                            break
+                        logger.warning(
+                            "skip candidate with empty paper id: zone=%s payload=%s",
+                            zone,
+                            json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
+                        )
+                        continue
 
-            pending_targets = self._filter_pending_targets(
-                zone=zone,
-                paper_id=paper_id,
-                targets=targets,
-                last_sent_target_map=last_sent_target_map,
-                force=force,
-            )
-            if pending_targets:
-                return {
-                    "zone": zone,
-                    "latest": latest,
-                    "paper_id": paper_id,
-                    "detail_url": detail_url,
-                    "pending_targets": pending_targets,
-                }, saw_submission, last_seen_dirty
+                    if not zone_latest_recorded:
+                        detail_url = f"https://shitjournal.org/preprints/{paper_id}"
+                        logger.info(
+                            "latest paper fetched: zone=%s id=%s detail_url=%s",
+                            zone,
+                            paper_id,
+                            detail_url,
+                        )
+                        zone_latest_recorded = True
+                        if last_seen_map.get(zone) != paper_id:
+                            last_seen_map[zone] = paper_id
+                            last_seen_dirty = True
 
-            if last_seen_map.get(zone) != paper_id:
-                last_seen_map[zone] = paper_id
-                last_seen_dirty = True
+                    pending_targets = self._filter_pending_targets(
+                        paper_id=paper_id,
+                        targets=targets,
+                        sent_history_lookup_by_target=sent_history_lookup_by_target,
+                        force=force,
+                    )
+                    if pending_targets:
+                        return {
+                            "zone": zone,
+                            "latest": candidate,
+                            "paper_id": paper_id,
+                            "detail_url": f"https://shitjournal.org/preprints/{paper_id}",
+                            "pending_targets": pending_targets,
+                            "sent_history_by_target": sent_history_by_target,
+                            "sent_history_lookup_by_target": sent_history_lookup_by_target,
+                        }, saw_submission, last_seen_dirty
+
+                if skip_zone or len(candidates) < RUN_FETCH_PAGE_SIZE:
+                    break
+                offset += len(candidates)
 
         return None, saw_submission, last_seen_dirty
 
@@ -739,18 +772,6 @@ class ShitJournalDailyPlugin(Star):
             detail = {}
         payload = {**payload, **(detail or {})}
         return payload
-
-    async def _prefetch_latest_submissions(
-        self,
-        zone_order: list[str],
-    ) -> list[dict[str, Any] | BaseException | None]:
-        async def _fetch_one(zone: str) -> dict[str, Any] | BaseException | None:
-            try:
-                return await self._supabase.fetch_latest_submission(zone)
-            except Exception as exc:
-                return exc
-
-        return await asyncio.gather(*[_fetch_one(zone) for zone in zone_order])
 
     async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path]:
         pdf_key = str(payload.get("pdf_path") or payload.get("file_path") or "").strip()
@@ -1189,9 +1210,70 @@ class ShitJournalDailyPlugin(Star):
         raw = await self.get_kv_data("last_seen_by_zone", {})
         return self._clean_kv_dict(raw)
 
-    async def _get_last_sent_target_map(self) -> dict[str, str]:
-        raw = await self.get_kv_data("last_sent_by_target_zone", {})
-        return self._clean_kv_dict(raw)
+    def _run_history_store_key(self, zone: str, session: str) -> str:
+        return f"{RUN_SENT_HISTORY_KV_PREFIX}{self._target_zone_key(zone, session)}"
+
+    def _normalize_target_zone_key(self, raw_key: Any) -> str:
+        text = str(raw_key or "").strip()
+        if not text:
+            return ""
+        zone, sep, session = text.partition("::")
+        if not sep:
+            return ""
+        session = session.strip()
+        if not session:
+            return ""
+        return self._target_zone_key(zone, session)
+
+    async def _ensure_run_sent_history_storage_ready(self) -> None:
+        if self._run_sent_history_storage_ready:
+            return
+        async with self._run_sent_history_lock:
+            if self._run_sent_history_storage_ready:
+                return
+
+            version = str(await self.get_kv_data(RUN_SENT_HISTORY_STORAGE_VERSION_KEY, "") or "").strip()
+            if version == RUN_SENT_HISTORY_STORAGE_VERSION:
+                self._run_sent_history_storage_ready = True
+                return
+
+            merged = await self._load_legacy_run_sent_histories()
+            for target_zone_key, history in merged.items():
+                zone, _, session = target_zone_key.partition("::")
+                if not session:
+                    continue
+                await self.put_kv_data(self._run_history_store_key(zone, session), history)
+            await self.put_kv_data(RUN_SENT_HISTORY_STORAGE_VERSION_KEY, RUN_SENT_HISTORY_STORAGE_VERSION)
+            self._run_sent_history_storage_ready = True
+
+    async def _load_legacy_run_sent_histories(self) -> dict[str, list[str]]:
+        legacy_raw = await self.get_kv_data("last_sent_by_target_zone", {})
+
+        merged: dict[str, list[str]] = {}
+        for raw_key, paper_id in self._clean_kv_dict(legacy_raw).items():
+            key = self._normalize_target_zone_key(raw_key)
+            if not key:
+                continue
+            merged[key] = [paper_id]
+
+        return merged
+
+    async def _get_run_sent_history(self, zone: str, session: str) -> list[str]:
+        await self._ensure_run_sent_history_storage_ready()
+        async with self._run_sent_history_lock:
+            return await self._get_run_sent_history_unlocked(zone, session)
+
+    async def _get_run_sent_history_unlocked(self, zone: str, session: str) -> list[str]:
+        raw = await self.get_kv_data(self._run_history_store_key(zone, session), [])
+        return self._clean_kv_list(raw)
+
+    async def _get_run_sent_histories(self, zone: str, targets: list[str]) -> dict[str, list[str]]:
+        await self._ensure_run_sent_history_storage_ready()
+        async with self._run_sent_history_lock:
+            histories: dict[str, list[str]] = {}
+            for session in targets:
+                histories[session] = await self._get_run_sent_history_unlocked(zone, session)
+            return histories
 
     def _chi_shi_group_zone_key(self, zone: str, session: str) -> str:
         return f"{self._normalize_zone_name(zone)}::{session}"
@@ -1283,11 +1365,9 @@ class ShitJournalDailyPlugin(Star):
         await self._ensure_chi_shi_history_storage_ready()
         async with self._chi_shi_dedupe_lock:
             history = await self._get_chi_shi_sent_history_unlocked(zone, session)
-            history = [item for item in history if item != paper_id]
-            history.insert(0, paper_id)
             await self.put_kv_data(
                 self._chi_shi_history_store_key(zone, session),
-                self._apply_chi_shi_history_policy(history),
+                self._apply_chi_shi_history_policy(self._prepend_history_item(history, paper_id)),
             )
 
     def _apply_chi_shi_history_policy(self, history: list[str]) -> list[str]:
@@ -1319,6 +1399,17 @@ class ShitJournalDailyPlugin(Star):
             seen.add(item_s)
             cleaned.append(item_s)
         return cleaned
+
+    def _prepend_history_item(self, history: list[str], item: str) -> list[str]:
+        value = str(item).strip()
+        if not value:
+            return history
+        updated = [entry for entry in history if entry != value]
+        updated.insert(0, value)
+        return updated
+
+    def _build_history_lookup(self, history_by_target: dict[str, list[str]]) -> dict[str, set[str]]:
+        return {session: set(history) for session, history in history_by_target.items()}
 
     def _clean_kv_list_dict(self, raw: Any) -> dict[str, list[str]]:
         if not isinstance(raw, dict):
@@ -1363,44 +1454,49 @@ class ShitJournalDailyPlugin(Star):
 
     def _filter_pending_targets(
         self,
-        zone: str,
         paper_id: str,
         targets: list[str],
-        last_sent_target_map: dict[str, str],
+        sent_history_lookup_by_target: dict[str, set[str]],
         force: bool,
     ) -> list[str]:
         if force:
             return targets.copy()
         pending_targets: list[str] = []
         for session in targets:
-            key = self._target_zone_key(zone, session)
-            if last_sent_target_map.get(key) != paper_id:
+            history_lookup = sent_history_lookup_by_target.get(session, set())
+            if paper_id not in history_lookup:
                 pending_targets.append(session)
         return pending_targets
 
-    def _mark_targets_delivered(
+    async def _mark_targets_delivered(
         self,
         zone: str,
         paper_id: str,
         success_targets: list[str],
-        last_sent_target_map: dict[str, str],
+        sent_history_by_target: dict[str, list[str]],
+        sent_history_lookup_by_target: dict[str, set[str]],
     ) -> None:
-        for session in success_targets:
-            key = self._target_zone_key(zone, session)
-            last_sent_target_map[key] = paper_id
+        await self._ensure_run_sent_history_storage_ready()
+        async with self._run_sent_history_lock:
+            for session in success_targets:
+                history = list(sent_history_by_target.get(session, []))
+                if not history:
+                    history = await self._get_run_sent_history_unlocked(zone, session)
+                history = self._prepend_history_item(history, paper_id)
+                sent_history_by_target[session] = history
+                sent_history_lookup_by_target[session] = set(history)
+                await self.put_kv_data(self._run_history_store_key(zone, session), history)
 
     def _all_targets_delivered(
         self,
-        zone: str,
         paper_id: str,
         targets: list[str],
-        last_sent_target_map: dict[str, str],
+        sent_history_lookup_by_target: dict[str, set[str]],
     ) -> bool:
         if not targets:
             return False
         for session in targets:
-            key = self._target_zone_key(zone, session)
-            if last_sent_target_map.get(key) != paper_id:
+            if paper_id not in sent_history_lookup_by_target.get(session, set()):
                 return False
         return True
 
