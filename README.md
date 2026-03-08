@@ -8,7 +8,7 @@
 ## 特性
 - 使用 Supabase API 直接获取最新论文（不依赖 Playwright）
 - 多时点定时任务（每日多个 `HH:MM`）
-- 去重推送（按 `zone + paper_id`）
+- 去重推送（按 `zone + paper_id`，已推送会自动回退到下一篇未推送论文）
 - 支持目标分区无新稿时按顺序回退到候补分区
 - 支持群内绑定/解绑推送目标
 - 指令管理员鉴权开关（默认开启）
@@ -53,6 +53,6 @@
 - 管理员身份依赖 AstrBot 全局 `admins_id` 配置。
 - 内置了默认 Supabase key；若需要可在插件配置或环境变量中覆盖。
 - `/我要赤石` 不受 `command_admin_only` 影响，默认所有人都可触发。
-- 开启 `enable_zone_fallback` 后，定时推送、`/shitjournal run` 和 `/我要赤石` 都会先尝试 `zone`，只有当前分区最近没有可推送论文时才依次尝试 `fallback_zones`。
-- 定时推送和 `/shitjournal run` 只检查主分区及候补分区各自“最新一篇”是否已推送，如果都已发送则跳过本轮。而 `/我要赤石` 会从新到旧查找目标分区第一篇本群未推送论文，如果都已推送再查找候补分区。
+- 开启 `enable_zone_fallback` 后，定时推送、`/shitjournal run` 和 `/我要赤石` 都会先尝试 `zone`，只有当前分区从新到旧都没有可推送论文时才依次尝试 `fallback_zones`。
+- 定时推送、`/shitjournal run` 和 `/我要赤石` 都会从新到旧查找目标分区第一篇未推送论文；若主分区都已推送，再按顺序检查候补分区。
 - `chi_shi_keep_full_history=true` 时会完整保留每个群、每个分区的已推送历史；关闭后仅保留最近 `chi_shi_history_limit` 条，更省存储，但更早的论文后续会被视为“未推送”。
