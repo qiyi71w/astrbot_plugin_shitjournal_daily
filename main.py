@@ -1268,18 +1268,19 @@ class ShitJournalDailyPlugin(Star):
                 self._run_sent_history_storage_ready = True
                 return
 
-            merged = await self._load_legacy_run_sent_histories()
+            legacy_raw = await self.get_kv_data("last_sent_by_target_zone", {})
+            merged = self._build_legacy_run_sent_histories(legacy_raw)
             for target_zone_key, history in merged.items():
                 zone, _, session = target_zone_key.partition("::")
                 if not session:
                     continue
                 await self.put_kv_data(self._run_history_store_key(zone, session), history)
+            if legacy_raw:
+                await self.put_kv_data("last_sent_by_target_zone", {})
             await self.put_kv_data(RUN_SENT_HISTORY_STORAGE_VERSION_KEY, RUN_SENT_HISTORY_STORAGE_VERSION)
             self._run_sent_history_storage_ready = True
 
-    async def _load_legacy_run_sent_histories(self) -> dict[str, list[str]]:
-        legacy_raw = await self.get_kv_data("last_sent_by_target_zone", {})
-
+    def _build_legacy_run_sent_histories(self, legacy_raw: Any) -> dict[str, list[str]]:
         merged: dict[str, list[str]] = {}
         for raw_key, paper_id in self._clean_kv_dict(legacy_raw).items():
             key = self._normalize_target_zone_key(raw_key)
@@ -1509,6 +1510,7 @@ class ShitJournalDailyPlugin(Star):
         sent_history_lookup_by_target: dict[str, set[str]],
     ) -> None:
         await self._ensure_run_sent_history_storage_ready()
+        pending_writes: list[tuple[str, list[str]]] = []
         async with self._run_sent_history_lock:
             for session in success_targets:
                 history = list(sent_history_by_target.get(session, []))
@@ -1522,7 +1524,11 @@ class ShitJournalDailyPlugin(Star):
                     sent_history_lookup_by_target[session] = history_lookup
                 else:
                     history_lookup.add(paper_id)
-                await self.put_kv_data(self._run_history_store_key(zone, session), history)
+                pending_writes.append((self._run_history_store_key(zone, session), history))
+
+        await asyncio.gather(
+            *[self.put_kv_data(store_key, history) for store_key, history in pending_writes],
+        )
 
     def _all_targets_delivered(
         self,
