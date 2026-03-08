@@ -671,6 +671,7 @@ class ShitJournalDailyPlugin(Star):
     ) -> tuple[dict[str, Any] | None, bool, bool]:
         saw_submission = False
         last_seen_dirty = False
+        first_page_results = await self._prefetch_run_candidate_pages(zone_order)
         for index, zone in enumerate(zone_order):
             is_primary = index == 0
             sent_history_by_target = await self._get_run_sent_histories(zone, targets)
@@ -679,21 +680,35 @@ class ShitJournalDailyPlugin(Star):
             zone_latest_recorded = False
 
             while True:
-                try:
-                    candidates = await self._supabase.fetch_latest_submissions(
-                        zone,
-                        RUN_FETCH_PAGE_SIZE,
-                        offset,
-                    )
-                except Exception as exc:
-                    if is_primary:
-                        raise RuntimeError(str(exc)) from exc
-                    logger.warning(
-                        "fetch latest fallback failed: zone=%s",
-                        zone,
-                        exc_info=(type(exc), exc, exc.__traceback__),
-                    )
-                    break
+                if offset == 0:
+                    first_page_result = first_page_results[index]
+                    if isinstance(first_page_result, BaseException):
+                        exc = first_page_result
+                        if is_primary:
+                            raise RuntimeError(str(exc)) from exc
+                        logger.warning(
+                            "fetch latest fallback failed: zone=%s",
+                            zone,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+                        break
+                    candidates = first_page_result
+                else:
+                    try:
+                        candidates = await self._supabase.fetch_latest_submissions(
+                            zone,
+                            RUN_FETCH_PAGE_SIZE,
+                            offset,
+                        )
+                    except Exception as exc:
+                        if is_primary:
+                            raise RuntimeError(str(exc)) from exc
+                        logger.warning(
+                            "fetch latest fallback failed: zone=%s",
+                            zone,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+                        break
 
                 if not candidates:
                     break
@@ -755,6 +770,22 @@ class ShitJournalDailyPlugin(Star):
                 offset += len(candidates)
 
         return None, saw_submission, last_seen_dirty
+
+    async def _prefetch_run_candidate_pages(
+        self,
+        zone_order: list[str],
+    ) -> list[list[dict[str, Any]] | BaseException]:
+        async def _fetch_one(zone: str) -> list[dict[str, Any]] | BaseException:
+            try:
+                return await self._supabase.fetch_latest_submissions(
+                    zone,
+                    RUN_FETCH_PAGE_SIZE,
+                    0,
+                )
+            except Exception as exc:
+                return exc
+
+        return await asyncio.gather(*[_fetch_one(zone) for zone in zone_order])
 
     async def _load_submission_payload(
         self,
@@ -1260,8 +1291,7 @@ class ShitJournalDailyPlugin(Star):
 
     async def _get_run_sent_history(self, zone: str, session: str) -> list[str]:
         await self._ensure_run_sent_history_storage_ready()
-        async with self._run_sent_history_lock:
-            return await self._get_run_sent_history_unlocked(zone, session)
+        return await self._get_run_sent_history_unlocked(zone, session)
 
     async def _get_run_sent_history_unlocked(self, zone: str, session: str) -> list[str]:
         raw = await self.get_kv_data(self._run_history_store_key(zone, session), [])
@@ -1269,11 +1299,13 @@ class ShitJournalDailyPlugin(Star):
 
     async def _get_run_sent_histories(self, zone: str, targets: list[str]) -> dict[str, list[str]]:
         await self._ensure_run_sent_history_storage_ready()
-        async with self._run_sent_history_lock:
-            histories: dict[str, list[str]] = {}
-            for session in targets:
-                histories[session] = await self._get_run_sent_history_unlocked(zone, session)
-            return histories
+        raw_histories = await asyncio.gather(
+            *[self.get_kv_data(self._run_history_store_key(zone, session), []) for session in targets],
+        )
+        return {
+            session: self._clean_kv_list(raw_history)
+            for session, raw_history in zip(targets, raw_histories)
+        }
 
     def _chi_shi_group_zone_key(self, zone: str, session: str) -> str:
         return f"{self._normalize_zone_name(zone)}::{session}"
@@ -1484,7 +1516,12 @@ class ShitJournalDailyPlugin(Star):
                     history = await self._get_run_sent_history_unlocked(zone, session)
                 history = self._prepend_history_item(history, paper_id)
                 sent_history_by_target[session] = history
-                sent_history_lookup_by_target[session] = set(history)
+                history_lookup = sent_history_lookup_by_target.get(session)
+                if history_lookup is None:
+                    history_lookup = set(history)
+                    sent_history_lookup_by_target[session] = history_lookup
+                else:
+                    history_lookup.add(paper_id)
                 await self.put_kv_data(self._run_history_store_key(zone, session), history)
 
     def _all_targets_delivered(
