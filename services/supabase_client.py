@@ -44,7 +44,7 @@ class SupabaseClient:
         try:
             await client.aclose()
         except Exception:
-            logger.warning("close http client failed", exc_info=True)
+            logger.warning("关闭 HTTP 客户端失败。", exc_info=True)
 
     async def fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
         latest_list = await self.fetch_latest_submissions(zone=zone, limit=1)
@@ -108,8 +108,8 @@ class SupabaseClient:
         data = await self._request_json("POST", url, json_body={"expiresIn": 3600})
         signed = str((data or {}).get("signedURL", "")).strip()
         if not signed:
-            logger.error("signedURL missing in response: url=%s", self._mask_url(url))
-            raise RuntimeError("signedURL missing in response")
+            logger.error("响应中缺少 signedURL 字段：地址=%s", self._mask_url(url))
+            raise RuntimeError("响应中缺少 signedURL")
         return self._resolve_signed_url(supabase_url, signed)
 
     async def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
@@ -135,7 +135,7 @@ class SupabaseClient:
                     content_type = str(response.headers.get("content-type", ""))
                     if status_code >= 500 and attempt < retry:
                         logger.warning(
-                            "pdf download retry due to status=%s attempt=%s/%s url=%s",
+                            "PDF 下载因状态码触发重试：状态码=%s 尝试=%s/%s 地址=%s",
                             status_code,
                             attempt,
                             retry,
@@ -146,17 +146,17 @@ class SupabaseClient:
                     if status_code >= 400:
                         body_preview = await self._read_response_preview(response)
                         logger.warning(
-                            "pdf download http error: status=%s url=%s body=%s",
+                            "PDF 下载 HTTP 错误：状态码=%s 地址=%s 响应=%s",
                             status_code,
                             safe_url,
                             body_preview,
                         )
                         raise _NonRetryableRequestError(
-                            f"http error {status_code} while downloading pdf",
+                            f"下载 PDF 时出现 HTTP 错误：{status_code}",
                         )
                     if "application/pdf" not in content_type.lower():
                         logger.warning(
-                            "pdf content-type is not application/pdf: %s (will validate header)",
+                            "PDF 响应的内容类型不是 application/pdf：%s（将继续校验文件头）",
                             content_type,
                         )
 
@@ -170,11 +170,11 @@ class SupabaseClient:
                                 header_preview.extend(chunk[:missing])
                                 if len(header_preview) >= 5 and bytes(header_preview[:5]) != b"%PDF-":
                                     raise _NonRetryableRequestError(
-                                        "downloaded file is not a valid PDF",
+                                        "下载的文件不是有效的 PDF",
                                     )
                             await fp.write(chunk)
                     if bytes(header_preview[:5]) != b"%PDF-":
-                        raise _NonRetryableRequestError("downloaded file is not a valid PDF")
+                        raise _NonRetryableRequestError("下载的文件不是有效的 PDF")
                 break
             except Exception as exc:
                 last_error = exc
@@ -183,7 +183,7 @@ class SupabaseClient:
                     break
                 if attempt < retry:
                     logger.warning(
-                        "pdf download retry due to exception attempt=%s/%s url=%s err=%s",
+                        "PDF 下载因异常触发重试：尝试=%s/%s 地址=%s 错误=%s",
                         attempt,
                         retry,
                         safe_url,
@@ -196,7 +196,7 @@ class SupabaseClient:
         if (not target_path.exists()) or target_path.stat().st_size <= 0:
             if last_error is not None:
                 raise last_error
-            raise RuntimeError("downloaded pdf file missing")
+            raise RuntimeError("下载后的 PDF 文件不存在")
 
         return status_code, content_type
 
@@ -245,15 +245,15 @@ class SupabaseClient:
                 if 300 <= response.status_code < 400:
                     location = self._mask_url(str(response.headers.get("location", "")).strip())
                     logger.warning(
-                        "supabase request redirect blocked: status=%s url=%s location=%s",
+                        "Supabase 请求被重定向，已阻止：状态码=%s 地址=%s 跳转=%s",
                         response.status_code,
                         safe_url,
-                        location or "<missing>",
+                        location or "<缺失>",
                     )
-                    raise _NonRetryableRequestError("unexpected redirect for supabase request")
+                    raise _NonRetryableRequestError("Supabase 请求发生未预期的重定向")
                 if response.status_code >= 500 and attempt < retry:
                     logger.warning(
-                        "http retrying due to status=%s attempt=%s/%s url=%s",
+                        "HTTP 请求因状态码触发重试：状态码=%s 尝试=%s/%s 地址=%s",
                         response.status_code,
                         attempt,
                         retry,
@@ -264,25 +264,25 @@ class SupabaseClient:
                 if response.status_code >= 400:
                     body_preview = self._decode_preview_bytes(response.content)
                     logger.warning(
-                        "supabase request http error: status=%s url=%s body=%s",
+                        "Supabase 请求 HTTP 错误：状态码=%s 地址=%s 响应=%s",
                         response.status_code,
                         safe_url,
                         body_preview,
                     )
                     raise _NonRetryableRequestError(
-                        f"http error {response.status_code} for supabase request",
+                        f"Supabase 请求返回 HTTP 错误：{response.status_code}",
                     )
                 try:
                     return response.json()
                 except Exception:
                     body_preview = self._decode_preview_bytes(response.content)
                     logger.warning(
-                        "supabase json decode failed: url=%s body=%s",
+                        "Supabase 响应 JSON 解析失败：地址=%s 响应=%s",
                         safe_url,
                         body_preview,
                     )
                     raise _NonRetryableRequestError(
-                        "json decode failed for supabase response",
+                        "Supabase 响应 JSON 解析失败",
                     )
             except Exception as exc:
                 last_error = exc
@@ -290,7 +290,7 @@ class SupabaseClient:
                     break
                 if attempt < retry:
                     logger.warning(
-                        "http retrying due to exception attempt=%s/%s url=%s err=%s",
+                        "HTTP 请求因异常触发重试：尝试=%s/%s 地址=%s 错误=%s",
                         attempt,
                         retry,
                         safe_url,
@@ -355,7 +355,7 @@ class SupabaseClient:
         try:
             target_path.unlink(missing_ok=True)
         except Exception:
-            logger.warning("failed to remove partial download: %s", str(target_path), exc_info=True)
+            logger.warning("删除未完成的下载文件失败：%s", str(target_path), exc_info=True)
 
     def _resolve_signed_url(self, supabase_url: str, signed: str) -> str:
         parsed = urlsplit(signed)
@@ -373,13 +373,13 @@ class SupabaseClient:
     def _validate_signed_url(self, signed_url: str) -> str:
         parsed = urlsplit(str(signed_url).strip())
         if parsed.scheme.lower() != "https":
-            raise RuntimeError("invalid signed url: scheme must be https")
+            raise RuntimeError("签名 URL 非法：协议必须为 https")
 
         expected = urlsplit(str(self._cfg("supabase_url", self._default_url)).strip())
         expected_host = (expected.hostname or "").lower()
         actual_host = (parsed.hostname or "").lower()
         if (not expected_host) or actual_host != expected_host:
-            raise RuntimeError("invalid signed url: unexpected host")
+            raise RuntimeError("签名 URL 非法：主机名不匹配")
         return signed_url
 
     def _mask_url(self, url: str) -> str:
@@ -389,5 +389,5 @@ class SupabaseClient:
             return mask_sensitive_text(text)
         base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         if parsed.query:
-            return f"{base}?<redacted>"
+            return f"{base}?<已隐藏>"
         return base

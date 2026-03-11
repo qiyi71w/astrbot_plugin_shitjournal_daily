@@ -61,6 +61,26 @@ ZONE_LABELS: dict[str, tuple[str, str]] = {
     "stone": ("构石", "The Stone"),
     "sediment": ("沉淀区", "Sediment"),
 }
+REPORT_STATUS_LABELS: dict[str, str] = {
+    "success": "成功",
+    "partial": "部分成功",
+    "failed": "失败",
+    "skipped": "已跳过",
+    "unknown": "未知",
+}
+REPORT_REASON_LABELS: dict[str, str] = {
+    "RUN_IN_PROGRESS": "已有推送任务正在执行",
+    "NO_TARGET_SESSION_CONFIGURED": "未配置推送目标",
+    "FETCH_LATEST_FAILED": "获取最新论文失败",
+    "ALREADY_DELIVERED": "没有可推送的新论文",
+    "LATEST_NOT_FOUND": "未找到最新论文",
+    "EMPTY_PAPER_ID": "论文 ID 为空",
+    "PREPARE_ASSETS_FAILED": "准备 PDF 资源失败",
+    "PUSHED_SUCCESSFULLY": "推送成功",
+    "PUSHED_PARTIALLY": "部分推送成功",
+    "ALL_SENDS_FAILED": "全部推送失败",
+    "UNKNOWN": "未知原因",
+}
 
 
 @register(
@@ -114,12 +134,12 @@ class ShitJournalDailyPlugin(Star):
         await self._clear_cron_jobs()
         await self._register_cron_jobs()
         await self._maybe_trim_temp_files(force=True)
-        logger.info("shitjournal_daily initialized.")
+        logger.info("shitjournal_daily 插件初始化完成。")
 
     async def terminate(self):
         await self._clear_cron_jobs()
         await self._supabase.close()
-        logger.info("shitjournal_daily terminated.")
+        logger.info("shitjournal_daily 插件已停止。")
 
     @filter.command("shitjournal")
     async def shitjournal(
@@ -182,9 +202,9 @@ class ShitJournalDailyPlugin(Star):
             for idx, target in enumerate(merged, start=1):
                 source = []
                 if target in cfg_targets:
-                    source.append("config")
+                    source.append("配置")
                 if target in bound:
-                    source.append("bind")
+                    source.append("绑定")
                 source_text = ",".join(source)
                 lines.append(f"{idx}. {target} [{source_text}]")
             yield event.plain_result("\n".join(lines))
@@ -192,7 +212,7 @@ class ShitJournalDailyPlugin(Star):
 
         if action == "run":
             force = bool(arg) and arg.split()[0] == "force"
-            report = await self._run_cycle(force=force, source=f"manual:{event.get_sender_id()}")
+            report = await self._run_cycle(force=force, source=f"手动:{event.get_sender_id()}")
             yield event.plain_result(self._render_report(report))
             return
 
@@ -272,7 +292,7 @@ class ShitJournalDailyPlugin(Star):
             success = True
         except Exception as exc:
             logger.error(
-                "chi_shi command failed: %s",
+                "“我要赤石”指令执行失败：%s",
                 mask_sensitive_text(str(exc)),
                 exc_info=True,
             )
@@ -283,12 +303,12 @@ class ShitJournalDailyPlugin(Star):
             try:
                 await self._maybe_trim_temp_files()
             except Exception:
-                logger.warning("trim temp files failed after chi_shi command", exc_info=True)
+                logger.warning("“我要赤石”执行后清理临时文件失败。", exc_info=True)
 
     async def _check_command_permission(self, event: AstrMessageEvent) -> bool:
         if not self._looks_like_message_event(event):
             logger.error(
-                "command permission check failed: invalid event type=%s",
+                "指令权限检查失败：无效事件类型=%s",
                 type(event).__name__,
             )
             return False
@@ -321,7 +341,7 @@ class ShitJournalDailyPlugin(Star):
             cleaned_kwargs = dict(kwargs)
             cleaned_kwargs.pop("event", None)
             logger.warning(
-                "command %s normalized shifted event from kwargs (type=%s).",
+                "指令 %s 从 kwargs 中修正了偏移的事件对象（原类型=%s）。",
                 command_name,
                 type(event).__name__,
             )
@@ -331,7 +351,7 @@ class ShitJournalDailyPlugin(Star):
             if self._looks_like_message_event(item):
                 shifted_args = args[:idx] + args[idx + 1 :]
                 logger.warning(
-                    "command %s normalized shifted event from args[%d] (type=%s).",
+                    "指令 %s 从 args[%d] 中修正了偏移的事件对象（原类型=%s）。",
                     command_name,
                     idx,
                     type(event).__name__,
@@ -339,7 +359,7 @@ class ShitJournalDailyPlugin(Star):
                 return item, shifted_args, kwargs
 
         logger.error(
-            "command %s event normalization failed: event_type=%s args_types=%s kwargs_keys=%s",
+            "指令 %s 事件归一化失败：event_type=%s args_types=%s kwargs_keys=%s",
             command_name,
             type(event).__name__,
             [type(item).__name__ for item in args[:4]],
@@ -412,7 +432,7 @@ class ShitJournalDailyPlugin(Star):
     async def _register_cron_jobs(self) -> None:
         cron_manager = getattr(self.context, "cron_manager", None)
         if cron_manager is None:
-            logger.error("cron_manager unavailable, schedule registration skipped.")
+            logger.error("cron_manager 不可用，已跳过定时任务注册。")
             return
 
         timezone = str(self._cfg("timezone", "Asia/Shanghai")).strip() or "Asia/Shanghai"
@@ -423,7 +443,7 @@ class ShitJournalDailyPlugin(Star):
         for idx, time_text in enumerate(times):
             parsed = self._parse_hhmm(time_text)
             if parsed is None:
-                logger.warning("invalid schedule time skipped: %s", time_text)
+                logger.warning("已跳过无效的定时时间：%s", time_text)
                 continue
             hour, minute = parsed
             cron_expression = f"{minute} {hour} * * *"
@@ -431,7 +451,7 @@ class ShitJournalDailyPlugin(Star):
                 name=f"{plugin_id}_shitjournal_{idx}",
                 cron_expression=cron_expression,
                 handler=self._scheduled_tick,
-                description=f"shitjournal daily push at {time_text}",
+                description=f"shitjournal 定时推送 {time_text}",
                 timezone=timezone,
                 payload={"schedule_time": time_text},
                 enabled=True,
@@ -439,7 +459,7 @@ class ShitJournalDailyPlugin(Star):
             )
             created_job_ids.append(job.job_id)
             logger.info(
-                "registered cron job: id=%s time=%s expr=%s tz=%s",
+                "已注册定时任务：任务ID=%s 时间=%s 表达式=%s 时区=%s",
                 job.job_id,
                 time_text,
                 cron_expression,
@@ -465,24 +485,35 @@ class ShitJournalDailyPlugin(Star):
         for job_id in ids:
             try:
                 await cron_manager.delete_job(job_id)
-                logger.info("deleted old cron job: %s", job_id)
+                logger.info("已删除旧定时任务：%s", job_id)
             except Exception:
-                logger.warning("delete cron job failed (ignored): %s", job_id, exc_info=True)
+                logger.warning("删除定时任务失败，已忽略：%s", job_id, exc_info=True)
 
         self._cron_job_ids = []
         await self.put_kv_data("cron_job_ids", [])
 
     async def _scheduled_tick(self, schedule_time: str = "") -> None:
-        report = await self._run_cycle(force=False, source=f"cron:{schedule_time or 'unknown'}")
-        logger.info("scheduled run finished: %s", self._render_report(report, include_debug=True))
+        report = await self._run_cycle(
+            force=False,
+            source=f"定时:{schedule_time or '未知'}",
+            latest_only=self._cfg_bool("schedule_latest_only", False),
+        )
+        logger.info("定时推送执行完成：%s", self._render_report(report, include_debug=True))
 
-    async def _run_cycle(self, force: bool, source: str) -> dict[str, Any]:
+    async def _run_cycle(
+        self,
+        *,
+        force: bool,
+        source: str,
+        latest_only: bool = False,
+    ) -> dict[str, Any]:
         if self._run_lock.locked():
             return {
                 "status": "skipped",
                 "reason_code": "RUN_IN_PROGRESS",
                 "source": source,
                 "debug_reason": "",
+                "latest_only": latest_only,
             }
 
         async with self._run_lock:
@@ -502,13 +533,15 @@ class ShitJournalDailyPlugin(Star):
                 "sent_total": 0,
                 "reason_code": "",
                 "debug_reason": "",
+                "latest_only": latest_only,
             }
             logger.info(
-                "run start: source=%s primary_zone=%s zone_order=%s force=%s",
+                "开始执行推送：来源=%s 主分区=%s 分区顺序=%s 强制=%s 仅最新=%s",
                 source,
                 primary_zone,
                 zone_order,
                 force,
+                latest_only,
             )
             try:
                 targets = await self._get_all_target_sessions()
@@ -523,6 +556,7 @@ class ShitJournalDailyPlugin(Star):
                         targets=targets,
                         last_seen_map=last_seen_map,
                         force=force,
+                        latest_only=latest_only,
                     )
                 except RuntimeError as exc:
                     message = str(exc).strip()
@@ -530,7 +564,7 @@ class ShitJournalDailyPlugin(Star):
                         report["reason_code"] = "EMPTY_PAPER_ID"
                         return report
                     logger.error(
-                        "fetch latest failed: %s",
+                        "获取最新论文失败：%s",
                         mask_sensitive_text(message),
                         exc_info=True,
                     )
@@ -559,7 +593,7 @@ class ShitJournalDailyPlugin(Star):
 
                 payload = await self._load_submission_payload(latest, paper_id)
                 logger.info(
-                    "submission metadata: %s",
+                    "论文元数据：%s",
                     json.dumps(self._build_meta_preview(payload), ensure_ascii=False),
                 )
 
@@ -567,7 +601,7 @@ class ShitJournalDailyPlugin(Star):
                     pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
                 except Exception as exc:
                     logger.error(
-                        "prepare pdf assets failed: %s",
+                        "准备 PDF 资源失败：%s",
                         mask_sensitive_text(str(exc)),
                         exc_info=True,
                     )
@@ -618,7 +652,7 @@ class ShitJournalDailyPlugin(Star):
                 try:
                     await self._maybe_trim_temp_files()
                 except Exception:
-                    logger.warning("trim temp files failed after run_cycle", exc_info=True)
+                    logger.warning("执行推送后清理临时文件失败。", exc_info=True)
 
     async def _select_chi_shi_candidate_from_zones(
         self,
@@ -642,7 +676,7 @@ class ShitJournalDailyPlugin(Star):
                     if is_primary:
                         raise
                     logger.warning(
-                        "fetch chi_shi fallback candidates failed: zone=%s",
+                        "获取“我要赤石”候补分区候选论文失败：分区=%s",
                         zone,
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
@@ -664,15 +698,29 @@ class ShitJournalDailyPlugin(Star):
 
     async def _select_run_candidate(
         self,
+        *,
         zone_order: list[str],
         targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
+        latest_only: bool,
     ) -> tuple[dict[str, Any] | None, bool, bool]:
+        first_page_results = await self._prefetch_run_candidate_pages(zone_order)
+        if latest_only:
+            return await self._select_latest_only_run_candidate(
+                zone_order=zone_order,
+                targets=targets,
+                last_seen_map=last_seen_map,
+                force=force,
+                first_page_results=first_page_results,
+            )
+
         saw_submission = False
         last_seen_dirty = False
-        first_page_results = await self._prefetch_run_candidate_pages(zone_order)
-        for index, zone in enumerate(zone_order):
+        for index, zone, first_page_result in self._iter_prefetched_run_pages(
+            zone_order=zone_order,
+            first_page_results=first_page_results,
+        ):
             is_primary = index == 0
             sent_history_by_target = await self._get_run_sent_histories(zone, targets)
             sent_history_lookup_by_target = self._build_history_lookup(sent_history_by_target)
@@ -681,13 +729,12 @@ class ShitJournalDailyPlugin(Star):
 
             while True:
                 if offset == 0:
-                    first_page_result = first_page_results[index]
                     if isinstance(first_page_result, BaseException):
                         exc = first_page_result
                         if is_primary:
                             raise RuntimeError(str(exc)) from exc
                         logger.warning(
-                            "fetch latest fallback failed: zone=%s",
+                            "获取候补分区最新论文失败：分区=%s",
                             zone,
                             exc_info=(type(exc), exc, exc.__traceback__),
                         )
@@ -704,7 +751,7 @@ class ShitJournalDailyPlugin(Star):
                         if is_primary:
                             raise RuntimeError(str(exc)) from exc
                         logger.warning(
-                            "fetch latest fallback failed: zone=%s",
+                            "获取候补分区最新论文失败：分区=%s",
                             zone,
                             exc_info=(type(exc), exc, exc.__traceback__),
                         )
@@ -722,14 +769,14 @@ class ShitJournalDailyPlugin(Star):
                             if is_primary:
                                 raise RuntimeError("EMPTY_PAPER_ID")
                             logger.warning(
-                                "skip fallback zone with empty paper id: zone=%s payload=%s",
+                                "候补分区最新论文缺少 ID，已跳过该分区：分区=%s 载荷=%s",
                                 zone,
                                 json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
                             )
                             skip_zone = True
                             break
                         logger.warning(
-                            "skip candidate with empty paper id: zone=%s payload=%s",
+                            "候选论文缺少 ID，已跳过：分区=%s 载荷=%s",
                             zone,
                             json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
                         )
@@ -738,7 +785,7 @@ class ShitJournalDailyPlugin(Star):
                     if not zone_latest_recorded:
                         detail_url = f"https://shitjournal.org/preprints/{paper_id}"
                         logger.info(
-                            "latest paper fetched: zone=%s id=%s detail_url=%s",
+                            "已获取最新论文：分区=%s 论文ID=%s 详情=%s",
                             zone,
                             paper_id,
                             detail_url,
@@ -755,21 +802,129 @@ class ShitJournalDailyPlugin(Star):
                         force=force,
                     )
                     if pending_targets:
-                        return {
-                            "zone": zone,
-                            "latest": candidate,
-                            "paper_id": paper_id,
-                            "detail_url": f"https://shitjournal.org/preprints/{paper_id}",
-                            "pending_targets": pending_targets,
-                            "sent_history_by_target": sent_history_by_target,
-                            "sent_history_lookup_by_target": sent_history_lookup_by_target,
-                        }, saw_submission, last_seen_dirty
+                        return self._build_run_candidate_result(
+                            zone=zone,
+                            candidate=candidate,
+                            paper_id=paper_id,
+                            pending_targets=pending_targets,
+                            sent_history_by_target=sent_history_by_target,
+                            sent_history_lookup_by_target=sent_history_lookup_by_target,
+                        ), saw_submission, last_seen_dirty
 
                 if skip_zone or len(candidates) < RUN_FETCH_PAGE_SIZE:
                     break
                 offset += len(candidates)
 
         return None, saw_submission, last_seen_dirty
+
+    async def _select_latest_only_run_candidate(
+        self,
+        *,
+        zone_order: list[str],
+        targets: list[str],
+        last_seen_map: dict[str, str],
+        force: bool,
+        first_page_results: list[list[dict[str, Any]] | BaseException],
+    ) -> tuple[dict[str, Any] | None, bool, bool]:
+        saw_submission = False
+        last_seen_dirty = False
+        for index, zone, first_page_result in self._iter_prefetched_run_pages(
+            zone_order=zone_order,
+            first_page_results=first_page_results,
+        ):
+            is_primary = index == 0
+            candidates = self._resolve_prefetched_run_candidates(
+                zone=zone,
+                is_primary=is_primary,
+                first_page_result=first_page_result,
+            )
+            candidate = candidates[0] if candidates else None
+            if not candidate:
+                continue
+
+            saw_submission = True
+            paper_id = self._extract_run_candidate_paper_id(
+                zone=zone,
+                candidate=candidate,
+                is_primary=is_primary,
+            )
+            if paper_id is None:
+                continue
+
+            if last_seen_map.get(zone) != paper_id:
+                last_seen_map[zone] = paper_id
+                last_seen_dirty = True
+            sent_history_by_target = await self._get_run_sent_histories(zone, targets)
+            sent_history_lookup_by_target = self._build_history_lookup(sent_history_by_target)
+            pending_targets = self._filter_pending_targets(
+                paper_id=paper_id,
+                targets=targets,
+                sent_history_lookup_by_target=sent_history_lookup_by_target,
+                force=force,
+            )
+            if pending_targets:
+                return self._build_run_candidate_result(
+                    zone=zone,
+                    candidate=candidate,
+                    paper_id=paper_id,
+                    pending_targets=pending_targets,
+                    sent_history_by_target=sent_history_by_target,
+                    sent_history_lookup_by_target=sent_history_lookup_by_target,
+                ), saw_submission, last_seen_dirty
+
+        return None, saw_submission, last_seen_dirty
+
+    def _iter_prefetched_run_pages(
+        self,
+        *,
+        zone_order: list[str],
+        first_page_results: list[list[dict[str, Any]] | BaseException],
+    ) -> list[tuple[int, str, list[dict[str, Any]] | BaseException]]:
+        if len(first_page_results) != len(zone_order):
+            raise RuntimeError(
+                "预取论文结果数量与分区数量不一致，_prefetch_run_candidate_pages 必须保持分区顺序",
+            )
+        return [
+            (index, zone, first_page_result)
+            for index, (zone, first_page_result) in enumerate(zip(zone_order, first_page_results))
+        ]
+
+    def _resolve_prefetched_run_candidates(
+        self,
+        *,
+        zone: str,
+        is_primary: bool,
+        first_page_result: list[dict[str, Any]] | BaseException,
+    ) -> list[dict[str, Any]]:
+        if isinstance(first_page_result, BaseException):
+            if is_primary:
+                raise RuntimeError(str(first_page_result)) from first_page_result
+            logger.warning(
+                "获取候补分区最新论文失败：分区=%s",
+                zone,
+                exc_info=(type(first_page_result), first_page_result, first_page_result.__traceback__),
+            )
+            return []
+        return first_page_result
+
+    def _extract_run_candidate_paper_id(
+        self,
+        *,
+        zone: str,
+        candidate: dict[str, Any],
+        is_primary: bool,
+    ) -> str | None:
+        paper_id = str(candidate.get("id", "")).strip()
+        if paper_id:
+            return paper_id
+        if is_primary:
+            raise RuntimeError("EMPTY_PAPER_ID")
+        logger.warning(
+            "候补分区最新论文缺少 ID，已跳过该分区：分区=%s 载荷=%s",
+            zone,
+            json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
+        )
+        return None
 
     async def _prefetch_run_candidate_pages(
         self,
@@ -787,6 +942,26 @@ class ShitJournalDailyPlugin(Star):
 
         return await asyncio.gather(*[_fetch_one(zone) for zone in zone_order])
 
+    def _build_run_candidate_result(
+        self,
+        *,
+        zone: str,
+        candidate: dict[str, Any],
+        paper_id: str,
+        pending_targets: list[str],
+        sent_history_by_target: dict[str, list[str]],
+        sent_history_lookup_by_target: dict[str, set[str]],
+    ) -> dict[str, Any]:
+        return {
+            "zone": zone,
+            "latest": candidate,
+            "paper_id": paper_id,
+            "detail_url": f"https://shitjournal.org/preprints/{paper_id}",
+            "pending_targets": pending_targets,
+            "sent_history_by_target": sent_history_by_target,
+            "sent_history_lookup_by_target": sent_history_lookup_by_target,
+        }
+
     async def _load_submission_payload(
         self,
         latest: dict[str, Any],
@@ -799,7 +974,7 @@ class ShitJournalDailyPlugin(Star):
         try:
             detail = await self._supabase.fetch_submission_detail(paper_id)
         except Exception:
-            logger.warning("fetch detail failed, fallback to latest payload", exc_info=True)
+            logger.warning("获取论文详情失败，将回退为列表页载荷。", exc_info=True)
             detail = {}
         payload = {**payload, **(detail or {})}
         return payload
@@ -807,22 +982,22 @@ class ShitJournalDailyPlugin(Star):
     async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path]:
         pdf_key = str(payload.get("pdf_path") or payload.get("file_path") or "").strip()
         if not pdf_key:
-            raise RuntimeError("pdf path missing")
+            raise RuntimeError("PDF 路径缺失")
 
         try:
             signed_url = await self._supabase.create_signed_pdf_url(pdf_key)
         except Exception as exc:
             logger.error(
-                "create signed url failed: %s",
+                "生成签名 URL 失败：%s",
                 mask_sensitive_text(str(exc)),
                 exc_info=True,
             )
-            raise RuntimeError("create signed url failed") from exc
+            raise RuntimeError("生成签名 URL 失败") from exc
 
         if not signed_url:
-            raise RuntimeError("empty signed url")
+            raise RuntimeError("签名 URL 为空")
 
-        logger.info("signed pdf url selected: %s", self._mask_token(signed_url))
+        logger.info("已取得签名 PDF 地址：%s", self._mask_token(signed_url))
         pdf_file, png_file = self._temp_files.build_output_paths(paper_id)
         await self._temp_files.mark_in_use(pdf_file, png_file)
 
@@ -832,28 +1007,28 @@ class ShitJournalDailyPlugin(Star):
                     signed_url,
                     pdf_file,
                 )
-                logger.info("pdf downloaded: status=%s content-type=%s", pdf_status, pdf_type)
+                logger.info("PDF 下载完成：状态码=%s 内容类型=%s", pdf_status, pdf_type)
             except Exception as exc:
                 logger.error(
-                    "download pdf failed: %s",
+                    "下载 PDF 失败：%s",
                     mask_sensitive_text(str(exc)),
                     exc_info=True,
                 )
-                raise RuntimeError("download pdf failed") from exc
+                raise RuntimeError("下载 PDF 失败") from exc
 
             self._pdf_service.ensure_pdf_size_limit(pdf_file)
             try:
                 await asyncio.to_thread(self._pdf_service.export_first_page_png, pdf_file, png_file)
             except Exception as exc:
                 logger.error(
-                    "export page1 failed: %s",
+                    "导出 PDF 首页预览图失败：%s",
                     mask_sensitive_text(str(exc)),
                     exc_info=True,
                 )
-                raise RuntimeError("export page1 failed") from exc
+                raise RuntimeError("导出 PDF 首页预览图失败") from exc
 
             png_size = png_file.stat().st_size if png_file.exists() else 0
-            logger.info("page1 png exported: file=%s bytes=%s", str(png_file), png_size)
+            logger.info("PDF 首页预览图导出完成：文件=%s 字节数=%s", str(png_file), png_size)
             return pdf_file, png_file
         except Exception:
             await self._temp_files.release(pdf_file, png_file)
@@ -881,8 +1056,8 @@ class ShitJournalDailyPlugin(Star):
                     chain = self._build_push_chain(text, png_file, pdf_file)
                     ok = await self.context.send_message(session, chain)
                 except Exception:
-                    logger.error("send message failed: session=%s", session, exc_info=True)
-            logger.info("send message result: session=%s success=%s", session, ok)
+                    logger.error("发送消息失败：会话=%s", session, exc_info=True)
+            logger.info("发送消息结果：会话=%s 是否成功=%s", session, ok)
             return session, ok
 
         results = await asyncio.gather(
@@ -893,7 +1068,7 @@ class ShitJournalDailyPlugin(Star):
         for result in results:
             if isinstance(result, BaseException):
                 logger.error(
-                    "unexpected send task error",
+                    "发送任务出现未预期异常",
                     exc_info=(type(result), result, result.__traceback__),
                 )
                 continue
@@ -924,7 +1099,7 @@ class ShitJournalDailyPlugin(Star):
         rating_count = self._fallback_text(payload.get("rating_count"))
 
         return (
-            "S.H.I.T Journal 最新论文推送\n"
+            "S.H.I.T Journal 论文推送\n"
             f"分区: {zone_text}\n"
             f"标题: {title}\n"
             f"作者: {author}\n"
@@ -932,7 +1107,7 @@ class ShitJournalDailyPlugin(Star):
             f"提交时间: {submitted}\n"
             f"学科: {discipline}\n"
             f"粘度: {viscosity}\n"
-            f"评分: avg={avg_score}, weighted={weighted_score}, votes={rating_count}\n"
+            f"评分: 平均={avg_score}, 加权={weighted_score}, 票数={rating_count}\n"
             f"详情: {detail_url}"
         )
 
@@ -952,7 +1127,7 @@ class ShitJournalDailyPlugin(Star):
             key = str(os.getenv(SUPABASE_KEY_ENV_NAME, "")).strip()
         if not key:
             raise RuntimeError(
-                "supabase_publishable_key is required; set plugin config or env "
+                "缺少 supabase_publishable_key，请在插件配置或环境变量中设置 "
                 f"{SUPABASE_KEY_ENV_NAME}",
             )
         return key
@@ -1546,7 +1721,7 @@ class ShitJournalDailyPlugin(Star):
     def _format_datetime(self, value: Any) -> str:
         text = str(value or "").strip()
         if not text:
-            return "N/A"
+            return "无"
         try:
             dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
             return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -1555,7 +1730,7 @@ class ShitJournalDailyPlugin(Star):
 
     def _format_number(self, value: Any) -> str:
         if value is None or value == "":
-            return "N/A"
+            return "无"
         try:
             return f"{float(value):.4f}"
         except Exception:
@@ -1563,7 +1738,7 @@ class ShitJournalDailyPlugin(Star):
 
     def _fallback_text(self, value: Any) -> str:
         text = str(value or "").strip()
-        return text if text else "N/A"
+        return text if text else "无"
 
     def _format_bilingual_label(
         self,
@@ -1572,7 +1747,7 @@ class ShitJournalDailyPlugin(Star):
     ) -> str:
         text = str(raw_value or "").strip()
         if not text:
-            return "N/A"
+            return "无"
         key = text.lower()
         if key in mapping:
             cn, en = mapping[key]
@@ -1583,7 +1758,7 @@ class ShitJournalDailyPlugin(Star):
         if "token=" not in url:
             return url
         head, _, _ = url.partition("token=")
-        return head + "token=<hidden>"
+        return head + "token=<已隐藏>"
 
     def _build_meta_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
         keys = [
@@ -1602,26 +1777,37 @@ class ShitJournalDailyPlugin(Star):
         ]
         return {k: payload.get(k) for k in keys}
 
+    def _render_run_mode_text(self, latest_only: bool) -> str:
+        if latest_only:
+            return "模式: 仅检查最新一篇"
+        return ""
+
     def _render_report(self, report: dict[str, Any], include_debug: bool = False) -> str:
-        status = report.get("status", "unknown")
+        status = str(report.get("status", "unknown") or "unknown")
         reason_code = str(report.get("reason_code") or report.get("reason") or "UNKNOWN")
         debug_reason = mask_sensitive_text(str(report.get("debug_reason", "")).strip())
+        latest_only = self._to_bool(report.get("latest_only"), False)
         paper_id = report.get("paper_id", "")
         zone = str(report.get("zone", "")).strip()
         requested_zone = str(report.get("requested_zone", "")).strip()
         sent_ok = report.get("sent_ok", 0)
         sent_total = report.get("sent_total", 0)
         detail_url = report.get("detail_url", "")
+        status_text = REPORT_STATUS_LABELS.get(status, status)
+        reason_text = REPORT_REASON_LABELS.get(reason_code, reason_code)
         text = (
-            f"[shitjournal run] status={status}\n"
-            f"reason={reason_code}\n"
-            f"zone={zone}\n"
-            f"paper_id={paper_id}\n"
-            f"send={sent_ok}/{sent_total}\n"
-            f"url={detail_url}"
+            f"[shitjournal 执行结果] 状态: {status_text}\n"
+            f"原因: {reason_text}\n"
+            f"分区: {zone}\n"
+            f"论文 ID: {paper_id}\n"
+            f"推送: {sent_ok}/{sent_total}\n"
+            f"详情: {detail_url}"
         )
+        mode_text = self._render_run_mode_text(latest_only)
+        if mode_text:
+            text += f"\n{mode_text}"
         if requested_zone and requested_zone != zone:
-            text += f"\nrequested_zone={requested_zone}"
+            text += f"\n请求分区: {requested_zone}"
         if include_debug and debug_reason:
-            text += f"\ndebug_reason={debug_reason}"
+            text += f"\n调试信息: {debug_reason}"
         return text
