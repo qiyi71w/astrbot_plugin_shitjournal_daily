@@ -717,7 +717,10 @@ class ShitJournalDailyPlugin(Star):
 
         saw_submission = False
         last_seen_dirty = False
-        for index, zone in enumerate(zone_order):
+        for index, zone, first_page_result in self._iter_prefetched_run_pages(
+            zone_order=zone_order,
+            first_page_results=first_page_results,
+        ):
             is_primary = index == 0
             sent_history_by_target = await self._get_run_sent_histories(zone, targets)
             sent_history_lookup_by_target = self._build_history_lookup(sent_history_by_target)
@@ -726,7 +729,6 @@ class ShitJournalDailyPlugin(Star):
 
             while True:
                 if offset == 0:
-                    first_page_result = first_page_results[index]
                     if isinstance(first_page_result, BaseException):
                         exc = first_page_result
                         if is_primary:
@@ -826,12 +828,15 @@ class ShitJournalDailyPlugin(Star):
     ) -> tuple[dict[str, Any] | None, bool, bool]:
         saw_submission = False
         last_seen_dirty = False
-        for index, zone in enumerate(zone_order):
+        for index, zone, first_page_result in self._iter_prefetched_run_pages(
+            zone_order=zone_order,
+            first_page_results=first_page_results,
+        ):
             is_primary = index == 0
             candidates = self._resolve_prefetched_run_candidates(
                 zone=zone,
                 is_primary=is_primary,
-                first_page_result=first_page_results[index],
+                first_page_result=first_page_result,
             )
             candidate = candidates[0] if candidates else None
             if not candidate:
@@ -843,7 +848,7 @@ class ShitJournalDailyPlugin(Star):
                 candidate=candidate,
                 is_primary=is_primary,
             )
-            if not paper_id:
+            if paper_id is None:
                 continue
 
             if last_seen_map.get(zone) != paper_id:
@@ -869,6 +874,21 @@ class ShitJournalDailyPlugin(Star):
 
         return None, saw_submission, last_seen_dirty
 
+    def _iter_prefetched_run_pages(
+        self,
+        *,
+        zone_order: list[str],
+        first_page_results: list[list[dict[str, Any]] | BaseException],
+    ) -> list[tuple[int, str, list[dict[str, Any]] | BaseException]]:
+        if len(first_page_results) != len(zone_order):
+            raise RuntimeError(
+                "预取论文结果数量与分区数量不一致，_prefetch_run_candidate_pages 必须保持分区顺序",
+            )
+        return [
+            (index, zone, first_page_result)
+            for index, (zone, first_page_result) in enumerate(zip(zone_order, first_page_results))
+        ]
+
     def _resolve_prefetched_run_candidates(
         self,
         *,
@@ -893,7 +913,7 @@ class ShitJournalDailyPlugin(Star):
         zone: str,
         candidate: dict[str, Any],
         is_primary: bool,
-    ) -> str:
+    ) -> str | None:
         paper_id = str(candidate.get("id", "")).strip()
         if paper_id:
             return paper_id
@@ -904,7 +924,7 @@ class ShitJournalDailyPlugin(Star):
             zone,
             json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
         )
-        return ""
+        return None
 
     async def _prefetch_run_candidate_pages(
         self,
@@ -1757,6 +1777,11 @@ class ShitJournalDailyPlugin(Star):
         ]
         return {k: payload.get(k) for k in keys}
 
+    def _render_run_mode_text(self, latest_only: bool) -> str:
+        if latest_only:
+            return "模式: 仅检查最新一篇"
+        return ""
+
     def _render_report(self, report: dict[str, Any], include_debug: bool = False) -> str:
         status = str(report.get("status", "unknown") or "unknown")
         reason_code = str(report.get("reason_code") or report.get("reason") or "UNKNOWN")
@@ -1778,8 +1803,9 @@ class ShitJournalDailyPlugin(Star):
             f"推送: {sent_ok}/{sent_total}\n"
             f"详情: {detail_url}"
         )
-        if latest_only:
-            text += "\n模式: 仅检查最新一篇"
+        mode_text = self._render_run_mode_text(latest_only)
+        if mode_text:
+            text += f"\n{mode_text}"
         if requested_zone and requested_zone != zone:
             text += f"\n请求分区: {requested_zone}"
         if include_debug and debug_reason:
