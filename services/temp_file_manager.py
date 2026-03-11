@@ -78,7 +78,7 @@ class TempFileManager:
                 except FileNotFoundError:
                     continue
                 except Exception:
-                    logger.warning("failed to delete temp file: %s", str(file_path), exc_info=True)
+                    logger.warning("删除临时文件失败：%s", str(file_path), exc_info=True)
 
     def _temp_file_key(self, path: Path) -> str:
         try:

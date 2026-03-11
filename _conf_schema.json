@@ -22,6 +22,12 @@
     "default": ["09:00", "21:00"],
     "hint": "支持多个 HH:MM，按本插件时区生效"
   },
+  "schedule_latest_only": {
+    "description": "定时自动推送仅检查最新一篇论文",
+    "type": "bool",
+    "default": false,
+    "hint": "仅影响定时任务；开启后若最新论文已推送，将直接跳过，不再回退到更早未推送论文；候补分区同样只检查各自最新一篇"
+  },
   "timezone": {
     "description": "定时任务时区",
     "type": "string",

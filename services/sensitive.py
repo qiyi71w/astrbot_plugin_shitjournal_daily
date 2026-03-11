@@ -14,7 +14,7 @@ _MASK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
             r"[^\s,;\"'}]+",
             flags=re.IGNORECASE,
         ),
-        r"\1<hidden>",
+        r"\1<已隐藏>",
     ),
     (
         re.compile(
@@ -23,28 +23,28 @@ _MASK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
             r"[^\"']+",
             flags=re.IGNORECASE,
         ),
-        r"\1<hidden>",
+        r"\1<已隐藏>",
     ),
     (
         re.compile(
             rf"(({_GENERIC_SECRET_KEY_PATTERN})\s*=\s*)[^&\s,;\"']+",
             flags=re.IGNORECASE,
         ),
-        r"\1<hidden>",
+        r"\1<已隐藏>",
     ),
     (
         re.compile(
             rf"(({_GENERIC_SECRET_KEY_PATTERN})\s*:\s*)[^\s,;\"'}}]+",
             flags=re.IGNORECASE,
         ),
-        r"\1<hidden>",
+        r"\1<已隐藏>",
     ),
     (
         re.compile(
             rf"([\"']{_GENERIC_SECRET_KEY_PATTERN}[\"']\s*:\s*[\"'])[^\"']+",
             flags=re.IGNORECASE,
         ),
-        r"\1<hidden>",
+        r"\1<已隐藏>",
     ),
 )
 
