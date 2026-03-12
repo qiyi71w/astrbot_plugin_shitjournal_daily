@@ -28,6 +28,12 @@
     "default": false,
     "hint": "仅影响定时任务；开启后若最新论文已推送，将直接跳过，不再回退到更早未推送论文；候补分区同样只检查各自最新一篇"
   },
+  "detail_hide_domain": {
+    "description": "详情仅显示 /preprints/路径",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，定时推送、[shitjournal 执行结果] 和 /我要赤石 推送里的“详情”会去掉前面的域名"
+  },
   "timezone": {
     "description": "定时任务时区",
     "type": "string",

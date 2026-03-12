@@ -28,6 +28,7 @@ except ImportError:
 
 DEFAULT_SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co"
 DEFAULT_SUPABASE_BUCKET = "manuscripts"
+DETAIL_URL_BASE = "https://shitjournal.org"
 DEFAULT_ZONE = "stone"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
@@ -283,7 +284,7 @@ class ShitJournalDailyPlugin(Star):
                 return
 
             payload = await self._load_submission_payload(candidate, paper_id)
-            detail_url = f"https://shitjournal.org/preprints/{paper_id}"
+            detail_url = self._build_preprint_detail_url(paper_id)
             pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(payload, detail_url, zone=zone)
             chain = self._build_push_chain(text, png_file, pdf_file)
@@ -783,7 +784,7 @@ class ShitJournalDailyPlugin(Star):
                         continue
 
                     if not zone_latest_recorded:
-                        detail_url = f"https://shitjournal.org/preprints/{paper_id}"
+                        detail_url = self._build_preprint_detail_url(paper_id)
                         logger.info(
                             "已获取最新论文：分区=%s 论文ID=%s 详情=%s",
                             zone,
@@ -956,7 +957,7 @@ class ShitJournalDailyPlugin(Star):
             "zone": zone,
             "latest": candidate,
             "paper_id": paper_id,
-            "detail_url": f"https://shitjournal.org/preprints/{paper_id}",
+            "detail_url": self._build_preprint_detail_url(paper_id),
             "pending_targets": pending_targets,
             "sent_history_by_target": sent_history_by_target,
             "sent_history_lookup_by_target": sent_history_lookup_by_target,
@@ -1097,6 +1098,7 @@ class ShitJournalDailyPlugin(Star):
         avg_score = self._format_number(payload.get("avg_score"))
         weighted_score = self._format_number(payload.get("weighted_score"))
         rating_count = self._fallback_text(payload.get("rating_count"))
+        detail_text = self._format_detail_text(detail_url)
 
         return (
             "S.H.I.T Journal 论文推送\n"
@@ -1108,8 +1110,23 @@ class ShitJournalDailyPlugin(Star):
             f"学科: {discipline}\n"
             f"粘度: {viscosity}\n"
             f"评分: 平均={avg_score}, 加权={weighted_score}, 票数={rating_count}\n"
-            f"详情: {detail_url}"
+            f"详情: {detail_text}"
         )
+
+    def _build_preprint_detail_url(self, paper_id: str) -> str:
+        normalized_paper_id = str(paper_id).strip()
+        return f"{DETAIL_URL_BASE}/preprints/{normalized_paper_id}"
+
+    def _format_detail_text(self, detail_url: str) -> str:
+        detail_text = str(detail_url or "").strip()
+        if not detail_text:
+            return detail_text
+        if not self._cfg_bool("detail_hide_domain", False):
+            return detail_text
+        if detail_text.startswith(DETAIL_URL_BASE):
+            path = detail_text[len(DETAIL_URL_BASE) :].strip()
+            return path if path.startswith("/") else f"/{path}"
+        return detail_text
 
     def _resolve_plugin_data_dir(self) -> Path:
         plugin_name = str(
@@ -1793,6 +1810,7 @@ class ShitJournalDailyPlugin(Star):
         sent_ok = report.get("sent_ok", 0)
         sent_total = report.get("sent_total", 0)
         detail_url = report.get("detail_url", "")
+        detail_text = self._format_detail_text(detail_url)
         status_text = REPORT_STATUS_LABELS.get(status, status)
         reason_text = REPORT_REASON_LABELS.get(reason_code, reason_code)
         text = (
@@ -1801,7 +1819,7 @@ class ShitJournalDailyPlugin(Star):
             f"分区: {zone}\n"
             f"论文 ID: {paper_id}\n"
             f"推送: {sent_ok}/{sent_total}\n"
-            f"详情: {detail_url}"
+            f"详情: {detail_text}"
         )
         mode_text = self._render_run_mode_text(latest_only)
         if mode_text:
