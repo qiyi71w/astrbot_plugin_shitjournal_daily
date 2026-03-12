@@ -28,7 +28,7 @@
 - `enable_zone_fallback`：目标分区没有可推送新稿时，是否尝试候补分区，默认 `false`
 - `fallback_zones`：候补分区列表，按填写顺序尝试，默认 `["septic"]`
 - `schedule_times`：默认 `["09:00","21:00"]`
-- `schedule_latest_only`：仅影响定时任务；开启后每个分区只检查最新一篇论文，默认 `false`
+- `schedule_latest_only`：仅影响定时任务；开启后按群只检查各分区最新一篇论文，默认 `false`
 - `detail_hide_domain`：开启后“详情”仅显示 `/preprints/xxxx` 路径，默认 `false`
 - `timezone`：默认 `Asia/Shanghai`
 - `target_sessions`：会话列表（UMO）
@@ -57,7 +57,7 @@
 - 内置了默认 Supabase key；若需要可在插件配置或环境变量中覆盖。
 - `/我要赤石` 不受 `command_admin_only` 影响，默认所有人都可触发。
 - 开启 `enable_zone_fallback` 后，定时推送、`/shitjournal run` 和 `/我要赤石` 都会先尝试 `zone`，只有当前分区从新到旧都没有可推送论文时才依次尝试 `fallback_zones`。
-- 定时推送、`/shitjournal run` 和 `/我要赤石` 都会从新到旧查找目标分区第一篇未推送论文；若主分区都已推送，再按顺序检查候补分区。
-- 开启 `schedule_latest_only` 后，只有定时推送会改变行为：主分区和候补分区都只检查各自最新一篇论文，不再回补更早未推送论文；`/shitjournal run` 和 `/我要赤石` 仍保持原逻辑。
+- 定时推送和 `/shitjournal run` 会按群独立从新到旧查找目标分区第一篇未推送论文；某个群命中后，本轮不会继续为该群检查更早论文或候补分区；`/我要赤石` 仍保持按群独立去重逻辑。
+- 开启 `schedule_latest_only` 后，定时推送会改为按群只检查各分区最新一篇论文：若某群在主分区最新一篇已推送，则继续检查候补分区最新一篇，不再回补同分区更早论文；`/shitjournal run` 和 `/我要赤石` 仍保持原逻辑。
 - 开启 `detail_hide_domain` 后，定时推送、`/shitjournal run` 的执行结果以及 `/我要赤石` 推送里的“详情”会显示为 `/preprints/xxxx`，不再带 `https://shitjournal.org` 域名。
 - `chi_shi_keep_full_history=true` 时会完整保留每个群、每个分区的已推送历史；关闭后仅保留最近 `chi_shi_history_limit` 条，更省存储，但更早的论文后续会被视为“未推送”。
