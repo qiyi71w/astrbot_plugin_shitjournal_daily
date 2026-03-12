@@ -32,6 +32,7 @@ DETAIL_URL_BASE = "https://shitjournal.org"
 DEFAULT_ZONE = "stone"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
+MAX_BATCH_SEND_CONCURRENCY = 2
 RUN_FETCH_PAGE_SIZE = 20
 CHI_SHI_FETCH_PAGE_SIZE = 20
 RUN_SENT_HISTORY_STORAGE_VERSION = "2"
@@ -76,12 +77,19 @@ REPORT_REASON_LABELS: dict[str, str] = {
     "ALREADY_DELIVERED": "没有可推送的新论文",
     "LATEST_NOT_FOUND": "未找到最新论文",
     "EMPTY_PAPER_ID": "论文 ID 为空",
+    "DELIVERY_STATE_WRITE_FAILED": "消息已发出，但写入去重状态失败",
     "PREPARE_ASSETS_FAILED": "准备 PDF 资源失败",
     "PUSHED_SUCCESSFULLY": "推送成功",
     "PUSHED_PARTIALLY": "部分推送成功",
     "ALL_SENDS_FAILED": "全部推送失败",
     "UNKNOWN": "未知原因",
 }
+
+
+class RunSelectionError(RuntimeError):
+    def __init__(self, reason_code: str, message: str = ""):
+        super().__init__(message or reason_code)
+        self.reason_code = reason_code
 
 
 @register(
@@ -560,11 +568,18 @@ class ShitJournalDailyPlugin(Star):
                         force=force,
                         latest_only=latest_only,
                     )
+                except RunSelectionError as exc:
+                    message = str(exc).strip()
+                    report["reason_code"] = exc.reason_code
+                    logger.error(
+                        "获取最新论文失败：%s",
+                        mask_sensitive_text(message),
+                        exc_info=True,
+                    )
+                    report["debug_reason"] = mask_sensitive_text(message)
+                    return report
                 except RuntimeError as exc:
                     message = str(exc).strip()
-                    if message == "EMPTY_PAPER_ID":
-                        report["reason_code"] = "EMPTY_PAPER_ID"
-                        return report
                     logger.error(
                         "获取最新论文失败：%s",
                         mask_sensitive_text(message),
@@ -581,7 +596,10 @@ class ShitJournalDailyPlugin(Star):
                         await self.put_kv_data("last_seen_by_zone", last_seen_map)
                     return report
 
-                batch_reports = await self._send_run_batches(batches)
+                batch_reports = await self._send_run_batches(
+                    batches,
+                    send_semaphore=asyncio.Semaphore(self._get_configured_send_concurrency()),
+                )
                 report["batches"] = batch_reports
                 report["sent_ok"] = sum(int(batch.get("sent_ok", 0)) for batch in batch_reports)
                 report["sent_total"] = sum(int(batch.get("sent_total", 0)) for batch in batch_reports)
@@ -597,16 +615,11 @@ class ShitJournalDailyPlugin(Star):
                 if last_seen_dirty:
                     await self.put_kv_data("last_seen_by_zone", last_seen_map)
 
-                if report["sent_ok"] == report["sent_total"]:
-                    report["status"] = "success"
-                    report["reason_code"] = "PUSHED_SUCCESSFULLY"
-                elif report["sent_ok"] > 0:
-                    report["status"] = "partial"
-                    report["reason_code"] = "PUSHED_PARTIALLY"
-                else:
-                    report["status"] = "failed"
-                    report["reason_code"] = "ALL_SENDS_FAILED"
-
+                report["status"], report["reason_code"] = self._resolve_run_batch_reports(
+                    batch_reports=batch_reports,
+                    sent_ok=report["sent_ok"],
+                    sent_total=report["sent_total"],
+                )
                 return report
             finally:
                 await self._temp_files.release(pdf_file, png_file)
@@ -666,26 +679,26 @@ class ShitJournalDailyPlugin(Star):
         force: bool,
         latest_only: bool,
     ) -> tuple[list[dict[str, Any]], bool, bool]:
-        first_page_results = await self._prefetch_run_candidate_pages(zone_order)
         if latest_only:
             return await self._select_latest_only_run_batches(
                 zone_order=zone_order,
                 targets=targets,
                 last_seen_map=last_seen_map,
                 force=force,
-                first_page_results=first_page_results,
             )
 
         saw_submission = False
         last_seen_dirty = False
         unresolved_targets = targets.copy()
         batches: list[dict[str, Any]] = []
-        for index, zone, first_page_result in self._iter_prefetched_run_pages(
-            zone_order=zone_order,
-            first_page_results=first_page_results,
-        ):
+        for index, zone in enumerate(zone_order):
             if not unresolved_targets:
                 break
+            first_page_candidates = await self._fetch_run_candidates_page(
+                zone=zone,
+                is_primary=index == 0,
+                offset=0,
+            )
             zone_batches, matched_targets, zone_saw_submission, zone_last_seen_dirty = (
                 await self._select_zone_run_batches(
                     zone=zone,
@@ -693,7 +706,7 @@ class ShitJournalDailyPlugin(Star):
                     unresolved_targets=unresolved_targets,
                     last_seen_map=last_seen_map,
                     force=force,
-                    first_page_result=first_page_result,
+                    first_page_candidates=first_page_candidates,
                 )
             )
             batches.extend(zone_batches)
@@ -709,18 +722,19 @@ class ShitJournalDailyPlugin(Star):
         targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
-        first_page_results: list[list[dict[str, Any]] | BaseException],
     ) -> tuple[list[dict[str, Any]], bool, bool]:
         saw_submission = False
         last_seen_dirty = False
         unresolved_targets = targets.copy()
         batches: list[dict[str, Any]] = []
-        for index, zone, first_page_result in self._iter_prefetched_run_pages(
-            zone_order=zone_order,
-            first_page_results=first_page_results,
-        ):
+        for index, zone in enumerate(zone_order):
             if not unresolved_targets:
                 break
+            first_page_candidates = await self._fetch_run_candidates_page(
+                zone=zone,
+                is_primary=index == 0,
+                offset=0,
+            )
             batch, matched_targets, zone_saw_submission, zone_last_seen_dirty = (
                 await self._select_latest_only_zone_batch(
                     zone=zone,
@@ -728,7 +742,7 @@ class ShitJournalDailyPlugin(Star):
                     unresolved_targets=unresolved_targets,
                     last_seen_map=last_seen_map,
                     force=force,
-                    first_page_result=first_page_result,
+                    first_page_candidates=first_page_candidates,
                 )
             )
             if batch:
@@ -746,8 +760,10 @@ class ShitJournalDailyPlugin(Star):
         unresolved_targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
-        first_page_result: list[dict[str, Any]] | BaseException,
+        first_page_candidates: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], set[str], bool, bool]:
+        if not first_page_candidates:
+            return [], set(), False, False
         sent_history_by_target = await self._get_run_sent_histories(zone, unresolved_targets)
         sent_history_lookup_by_target = self._build_history_lookup(sent_history_by_target)
         batches: list[dict[str, Any]] = []
@@ -760,11 +776,9 @@ class ShitJournalDailyPlugin(Star):
             candidates = await self._load_run_candidates_page(
                 zone=zone,
                 is_primary=is_primary,
-                first_page_result=first_page_result,
+                first_page_candidates=first_page_candidates,
                 offset=offset,
             )
-            if candidates is None:
-                break
             if not candidates:
                 break
             saw_submission = True
@@ -799,13 +813,9 @@ class ShitJournalDailyPlugin(Star):
         unresolved_targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
-        first_page_result: list[dict[str, Any]] | BaseException,
+        first_page_candidates: list[dict[str, Any]],
     ) -> tuple[dict[str, Any] | None, set[str], bool, bool]:
-        candidates = self._resolve_prefetched_run_candidates(
-            zone=zone,
-            is_primary=is_primary,
-            first_page_result=first_page_result,
-        )
+        candidates = first_page_candidates
         if not candidates:
             return None, set(), False, False
         candidate = candidates[0]
@@ -814,8 +824,6 @@ class ShitJournalDailyPlugin(Star):
             candidate=candidate,
             is_primary=is_primary,
         )
-        if paper_id is None:
-            return None, set(), True, False
         last_seen_dirty = False
         if last_seen_map.get(zone) != paper_id:
             last_seen_map[zone] = paper_id
@@ -846,31 +854,16 @@ class ShitJournalDailyPlugin(Star):
         *,
         zone: str,
         is_primary: bool,
-        first_page_result: list[dict[str, Any]] | BaseException,
+        first_page_candidates: list[dict[str, Any]],
         offset: int,
-    ) -> list[dict[str, Any]] | None:
+    ) -> list[dict[str, Any]]:
         if offset == 0:
-            if isinstance(first_page_result, BaseException):
-                if is_primary:
-                    raise RuntimeError(str(first_page_result)) from first_page_result
-                logger.warning(
-                    "获取候补分区最新论文失败：分区=%s",
-                    zone,
-                    exc_info=(type(first_page_result), first_page_result, first_page_result.__traceback__),
-                )
-                return None
-            return first_page_result
-        try:
-            return await self._supabase.fetch_latest_submissions(zone, RUN_FETCH_PAGE_SIZE, offset)
-        except Exception as exc:
-            if is_primary:
-                raise RuntimeError(str(exc)) from exc
-            logger.warning(
-                "获取候补分区最新论文失败：分区=%s",
-                zone,
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            return None
+            return first_page_candidates
+        return await self._fetch_run_candidates_page(
+            zone=zone,
+            is_primary=is_primary,
+            offset=offset,
+        )
 
     def _build_zone_run_page_batches(
         self,
@@ -894,14 +887,11 @@ class ShitJournalDailyPlugin(Star):
             paper_id = str(candidate.get("id", "")).strip()
             if not paper_id:
                 if offset == 0 and candidate_index == 0:
-                    if is_primary:
-                        raise RuntimeError("EMPTY_PAPER_ID")
-                    logger.warning(
-                        "候补分区最新论文缺少 ID，已跳过该分区：分区=%s 载荷=%s",
-                        zone,
-                        json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
+                    self._raise_run_candidate_id_error(
+                        zone=zone,
+                        is_primary=is_primary,
+                        candidate=candidate,
                     )
-                    return [], True, zone_latest_recorded, last_seen_dirty, page_targets
                 logger.warning(
                     "候选论文缺少 ID，已跳过：分区=%s 载荷=%s",
                     zone,
@@ -983,38 +973,53 @@ class ShitJournalDailyPlugin(Star):
             "sent_history_lookup_by_target": sent_history_lookup_by_target,
         }
 
-    def _iter_prefetched_run_pages(
-        self,
-        *,
-        zone_order: list[str],
-        first_page_results: list[list[dict[str, Any]] | BaseException],
-    ) -> list[tuple[int, str, list[dict[str, Any]] | BaseException]]:
-        if len(first_page_results) != len(zone_order):
-            raise RuntimeError(
-                "预取论文结果数量与分区数量不一致，_prefetch_run_candidate_pages 必须保持分区顺序",
-            )
-        return [
-            (index, zone, first_page_result)
-            for index, (zone, first_page_result) in enumerate(zip(zone_order, first_page_results))
-        ]
-
-    def _resolve_prefetched_run_candidates(
+    async def _fetch_run_candidates_page(
         self,
         *,
         zone: str,
         is_primary: bool,
-        first_page_result: list[dict[str, Any]] | BaseException,
+        offset: int,
     ) -> list[dict[str, Any]]:
-        if isinstance(first_page_result, BaseException):
-            if is_primary:
-                raise RuntimeError(str(first_page_result)) from first_page_result
-            logger.warning(
-                "获取候补分区最新论文失败：分区=%s",
-                zone,
-                exc_info=(type(first_page_result), first_page_result, first_page_result.__traceback__),
+        try:
+            return await self._supabase.fetch_latest_submissions(zone, RUN_FETCH_PAGE_SIZE, offset)
+        except Exception as exc:
+            self._raise_run_candidate_fetch_error(
+                zone=zone,
+                is_primary=is_primary,
+                offset=offset,
+                error=exc,
             )
-            return []
-        return first_page_result
+
+    def _raise_run_candidate_fetch_error(
+        self,
+        *,
+        zone: str,
+        is_primary: bool,
+        offset: int,
+        error: BaseException,
+    ) -> None:
+        if offset == 0:
+            zone_type = "主分区首页" if is_primary else "候补分区首页"
+        else:
+            zone_type = "候选页"
+        raise RunSelectionError(
+            "FETCH_LATEST_FAILED",
+            f"获取{zone_type}论文失败：分区={zone} 偏移={offset} 错误={error}",
+        ) from error
+
+    def _raise_run_candidate_id_error(
+        self,
+        *,
+        zone: str,
+        is_primary: bool,
+        candidate: dict[str, Any],
+    ) -> None:
+        zone_type = "主分区最新论文" if is_primary else "候补分区最新论文"
+        meta_preview = json.dumps(self._build_meta_preview(candidate), ensure_ascii=False)
+        raise RunSelectionError(
+            "EMPTY_PAPER_ID",
+            f"{zone_type}缺少 ID：分区={zone} 载荷={meta_preview}",
+        )
 
     def _extract_run_candidate_paper_id(
         self,
@@ -1022,42 +1027,40 @@ class ShitJournalDailyPlugin(Star):
         zone: str,
         candidate: dict[str, Any],
         is_primary: bool,
-    ) -> str | None:
+    ) -> str:
         paper_id = str(candidate.get("id", "")).strip()
         if paper_id:
             return paper_id
-        if is_primary:
-            raise RuntimeError("EMPTY_PAPER_ID")
-        logger.warning(
-            "候补分区最新论文缺少 ID，已跳过该分区：分区=%s 载荷=%s",
-            zone,
-            json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
+        self._raise_run_candidate_id_error(
+            zone=zone,
+            is_primary=is_primary,
+            candidate=candidate,
         )
-        return None
 
-    async def _prefetch_run_candidate_pages(
+    async def _send_run_batches(
         self,
-        zone_order: list[str],
-    ) -> list[list[dict[str, Any]] | BaseException]:
-        async def _fetch_one(zone: str) -> list[dict[str, Any]] | BaseException:
-            try:
-                return await self._supabase.fetch_latest_submissions(
-                    zone,
-                    RUN_FETCH_PAGE_SIZE,
-                    0,
-                )
-            except Exception as exc:
-                return exc
+        batches: list[dict[str, Any]],
+        *,
+        send_semaphore: asyncio.Semaphore | None = None,
+    ) -> list[dict[str, Any]]:
+        if not batches:
+            return []
+        semaphore = asyncio.Semaphore(self._resolve_batch_send_concurrency(len(batches)))
 
-        return await asyncio.gather(*[_fetch_one(zone) for zone in zone_order])
+        async def _send_one(batch: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                if send_semaphore is None:
+                    return await self._send_run_batch(batch)
+                return await self._send_run_batch(batch, send_semaphore=send_semaphore)
 
-    async def _send_run_batches(self, batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        for batch in batches:
-            results.append(await self._send_run_batch(batch))
-        return results
+        return await asyncio.gather(*[_send_one(batch) for batch in batches])
 
-    async def _send_run_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+    async def _send_run_batch(
+        self,
+        batch: dict[str, Any],
+        *,
+        send_semaphore: asyncio.Semaphore | None = None,
+    ) -> dict[str, Any]:
         zone = str(batch["zone"])
         latest = dict(batch["latest"])
         paper_id = str(batch["paper_id"])
@@ -1090,6 +1093,7 @@ class ShitJournalDailyPlugin(Star):
                 text=text,
                 png_file=png_file,
                 pdf_file=pdf_file,
+                send_semaphore=send_semaphore,
             )
             report["sent_ok"] = sent_ok
             if sent_success_targets:
@@ -1100,8 +1104,23 @@ class ShitJournalDailyPlugin(Star):
                     sent_history_by_target=sent_history_by_target,
                     sent_history_lookup_by_target=sent_history_lookup_by_target,
                 )
+            report["status"] = self._resolve_send_status(sent_ok=sent_ok, sent_total=len(targets))
+            report["reason_code"] = self._resolve_send_reason_code(str(report["status"]))
             return report
         except Exception as exc:
+            if report["sent_ok"] > 0:
+                logger.error(
+                    "写入推送去重状态失败：分区=%s 论文ID=%s 错误=%s",
+                    zone,
+                    paper_id,
+                    mask_sensitive_text(str(exc)),
+                    exc_info=True,
+                )
+                return self._build_failed_run_batch_report(
+                    report=report,
+                    reason_code="DELIVERY_STATE_WRITE_FAILED",
+                    debug_reason=str(exc),
+                )
             logger.error(
                 "批次推送失败：分区=%s 论文ID=%s 错误=%s",
                 zone,
@@ -1109,8 +1128,11 @@ class ShitJournalDailyPlugin(Star):
                 mask_sensitive_text(str(exc)),
                 exc_info=True,
             )
-            report["debug_reason"] = mask_sensitive_text(str(exc))
-            return report
+            return self._build_failed_run_batch_report(
+                report=report,
+                reason_code="ALL_SENDS_FAILED",
+                debug_reason=str(exc),
+            )
         finally:
             await self._temp_files.release(pdf_file, png_file)
             try:
@@ -1127,6 +1149,8 @@ class ShitJournalDailyPlugin(Star):
         sent_total: int,
     ) -> dict[str, Any]:
         return {
+            "status": "failed",
+            "reason_code": "",
             "zone": zone,
             "paper_id": paper_id,
             "detail_url": detail_url,
@@ -1134,6 +1158,61 @@ class ShitJournalDailyPlugin(Star):
             "sent_total": sent_total,
             "debug_reason": "",
         }
+
+    def _build_failed_run_batch_report(
+        self,
+        *,
+        report: dict[str, Any],
+        reason_code: str,
+        debug_reason: str,
+    ) -> dict[str, Any]:
+        report["status"] = "failed"
+        report["reason_code"] = reason_code
+        report["debug_reason"] = mask_sensitive_text(debug_reason)
+        return report
+
+    def _resolve_send_status(self, *, sent_ok: int, sent_total: int) -> str:
+        if sent_total > 0 and sent_ok == sent_total:
+            return "success"
+        if sent_ok > 0:
+            return "partial"
+        return "failed"
+
+    def _resolve_run_batch_reports(
+        self,
+        *,
+        batch_reports: list[dict[str, Any]],
+        sent_ok: int,
+        sent_total: int,
+    ) -> tuple[str, str]:
+        if any(str(batch.get("reason_code", "")) == "DELIVERY_STATE_WRITE_FAILED" for batch in batch_reports):
+            return "failed", "DELIVERY_STATE_WRITE_FAILED"
+        status = self._resolve_send_status(sent_ok=sent_ok, sent_total=sent_total)
+        return status, self._resolve_send_reason_code(status)
+
+    def _resolve_send_reason_code(self, status: str) -> str:
+        if status == "success":
+            return "PUSHED_SUCCESSFULLY"
+        if status == "partial":
+            return "PUSHED_PARTIALLY"
+        return "ALL_SENDS_FAILED"
+
+    def _resolve_batch_send_concurrency(self, batch_count: int) -> int:
+        return min(MAX_BATCH_SEND_CONCURRENCY, self._get_configured_send_concurrency(), batch_count)
+
+    def _get_configured_send_concurrency(self) -> int:
+        raw_concurrency = getattr(self, "_send_concurrency", 3)
+        try:
+            configured_concurrency = int(raw_concurrency)
+        except (TypeError, ValueError):
+            configured_concurrency = 3
+        return min(MAX_SEND_CONCURRENCY, max(1, configured_concurrency))
+
+    def _render_status_text(self, status: str) -> str:
+        return REPORT_STATUS_LABELS.get(status, status)
+
+    def _render_reason_text(self, reason_code: str) -> str:
+        return REPORT_REASON_LABELS.get(reason_code, reason_code)
 
     def _pick_first_batch_debug_reason(self, batch_reports: list[dict[str, Any]]) -> str:
         for batch_report in batch_reports:
@@ -1220,14 +1299,10 @@ class ShitJournalDailyPlugin(Star):
         text: str,
         png_file: Path,
         pdf_file: Path,
+        *,
+        send_semaphore: asyncio.Semaphore | None = None,
     ) -> tuple[int, list[str]]:
-        raw_concurrency = getattr(self, "_send_concurrency", 3)
-        try:
-            configured_concurrency = int(raw_concurrency)
-        except (TypeError, ValueError):
-            configured_concurrency = 3
-        concurrency = min(MAX_SEND_CONCURRENCY, max(1, configured_concurrency))
-        semaphore = asyncio.Semaphore(concurrency)
+        semaphore = send_semaphore or asyncio.Semaphore(self._get_configured_send_concurrency())
 
         async def _send_one(session: str) -> tuple[str, bool]:
             ok = False
@@ -1978,12 +2053,17 @@ class ShitJournalDailyPlugin(Star):
 
     def _render_report_batch_line(self, index: int, batch: dict[str, Any]) -> list[str]:
         detail_text = self._format_detail_text(str(batch.get("detail_url", "")))
+        batch_status = str(batch.get("status", "unknown") or "unknown")
+        batch_status_text = self._render_status_text(batch_status)
+        batch_reason_code = str(batch.get("reason_code", "")).strip()
+        batch_reason_text = self._render_reason_text(batch_reason_code) if batch_reason_code else ""
+        suffix = f" 原因={batch_reason_text}" if batch_status == "failed" and batch_reason_text else ""
         return [
             (
-                f"第{index}批: 分区={batch.get('zone', '')} "
+                f"第{index}批: 状态={batch_status_text} 分区={batch.get('zone', '')} "
                 f"论文ID={batch.get('paper_id', '')} "
                 f"推送={batch.get('sent_ok', 0)}/{batch.get('sent_total', 0)} "
-                f"详情={detail_text}"
+                f"详情={detail_text}{suffix}"
             ),
         ]
 
@@ -2018,14 +2098,18 @@ class ShitJournalDailyPlugin(Star):
         include_debug: bool,
     ) -> str:
         lines = self._render_report_header(status_text, reason_text)
+        batch_reason_code = str(batch.get("reason_code", "")).strip()
         lines.extend(
             [
+                f"批次状态: {self._render_status_text(str(batch.get('status', 'unknown') or 'unknown'))}",
                 f"分区: {batch.get('zone', '')}",
                 f"论文 ID: {batch.get('paper_id', '')}",
                 f"推送: {batch.get('sent_ok', 0)}/{batch.get('sent_total', 0)}",
                 f"详情: {self._format_detail_text(str(batch.get('detail_url', '')))}",
             ]
         )
+        if batch_reason_code and batch_reason_code != "PUSHED_SUCCESSFULLY":
+            lines.append(f"批次原因: {self._render_reason_text(batch_reason_code)}")
         return self._append_report_suffix(
             lines=lines,
             latest_only=latest_only,
@@ -2066,8 +2150,8 @@ class ShitJournalDailyPlugin(Star):
         debug_reason = mask_sensitive_text(str(report.get("debug_reason", "")).strip())
         latest_only = self._to_bool(report.get("latest_only"), False)
         requested_zone = str(report.get("requested_zone", "")).strip()
-        status_text = REPORT_STATUS_LABELS.get(status, status)
-        reason_text = REPORT_REASON_LABELS.get(reason_code, reason_code)
+        status_text = self._render_status_text(status)
+        reason_text = self._render_reason_text(reason_code)
         batches = list(report.get("batches", []))
         if len(batches) > 1:
             return self._render_multi_batch_report(
@@ -2091,6 +2175,7 @@ class ShitJournalDailyPlugin(Star):
                 include_debug=include_debug,
             )
         empty_batch = {
+            "status": str(report.get("status", "unknown") or "unknown"),
             "zone": str(report.get("zone", "")).strip(),
             "paper_id": str(report.get("paper_id", "")).strip(),
             "detail_url": str(report.get("detail_url", "")).strip(),
