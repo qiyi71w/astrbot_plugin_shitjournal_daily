@@ -528,8 +528,6 @@ class ShitJournalDailyPlugin(Star):
         async with self._run_lock:
             primary_zone = self._get_primary_zone()
             zone_order = self._get_candidate_zones(primary_zone)
-            pdf_file: Path | None = None
-            png_file: Path | None = None
             report: dict[str, Any] = {
                 "status": "failed",
                 "source": source,
@@ -622,7 +620,6 @@ class ShitJournalDailyPlugin(Star):
                 )
                 return report
             finally:
-                await self._temp_files.release(pdf_file, png_file)
                 try:
                     await self._maybe_trim_temp_files()
                 except Exception:
@@ -760,7 +757,7 @@ class ShitJournalDailyPlugin(Star):
         unresolved_targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
-        first_page_candidates: list[dict[str, Any]],
+        first_page_candidates: list[dict[str, Any]] | None,
     ) -> tuple[list[dict[str, Any]], set[str], bool, bool]:
         if not first_page_candidates:
             return [], set(), False, False
@@ -813,7 +810,7 @@ class ShitJournalDailyPlugin(Star):
         unresolved_targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
-        first_page_candidates: list[dict[str, Any]],
+        first_page_candidates: list[dict[str, Any]] | None,
     ) -> tuple[dict[str, Any] | None, set[str], bool, bool]:
         candidates = first_page_candidates
         if not candidates:
@@ -824,6 +821,8 @@ class ShitJournalDailyPlugin(Star):
             candidate=candidate,
             is_primary=is_primary,
         )
+        if paper_id is None:
+            return None, set(), True, False
         last_seen_dirty = False
         if last_seen_map.get(zone) != paper_id:
             last_seen_map[zone] = paper_id
@@ -854,9 +853,9 @@ class ShitJournalDailyPlugin(Star):
         *,
         zone: str,
         is_primary: bool,
-        first_page_candidates: list[dict[str, Any]],
+        first_page_candidates: list[dict[str, Any]] | None,
         offset: int,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | None:
         if offset == 0:
             return first_page_candidates
         return await self._fetch_run_candidates_page(
@@ -882,22 +881,26 @@ class ShitJournalDailyPlugin(Star):
     ) -> tuple[list[dict[str, Any]], bool, bool, bool, set[str]]:
         page_batches: list[dict[str, Any]] = []
         page_targets: set[str] = set()
+        occupied_targets = set(matched_targets)
         last_seen_dirty = False
         for candidate_index, candidate in enumerate(candidates):
             paper_id = str(candidate.get("id", "")).strip()
             if not paper_id:
                 if offset == 0 and candidate_index == 0:
-                    self._raise_run_candidate_id_error(
+                    paper_id = self._extract_run_candidate_paper_id(
                         zone=zone,
                         is_primary=is_primary,
                         candidate=candidate,
                     )
-                logger.warning(
-                    "候选论文缺少 ID，已跳过：分区=%s 载荷=%s",
-                    zone,
-                    json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
-                )
-                continue
+                    if paper_id is None:
+                        return [], True, zone_latest_recorded, last_seen_dirty, page_targets
+                else:
+                    logger.warning(
+                        "候选论文缺少 ID，已跳过：分区=%s 载荷=%s",
+                        zone,
+                        json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
+                    )
+                    continue
             if not zone_latest_recorded:
                 logger.info(
                     "已获取最新论文：分区=%s 论文ID=%s 详情=%s",
@@ -912,7 +915,7 @@ class ShitJournalDailyPlugin(Star):
             batch_targets = self._match_run_batch_targets(
                 paper_id=paper_id,
                 unresolved_targets=unresolved_targets,
-                matched_targets=matched_targets | page_targets,
+                matched_targets=occupied_targets,
                 sent_history_lookup_by_target=sent_history_lookup_by_target,
                 force=force,
             )
@@ -929,6 +932,7 @@ class ShitJournalDailyPlugin(Star):
                 )
             )
             page_targets.update(batch_targets)
+            occupied_targets.update(batch_targets)
         return page_batches, False, zone_latest_recorded, last_seen_dirty, page_targets
 
     def _subtract_targets(self, targets: list[str], removed_targets: set[str]) -> list[str]:
@@ -945,13 +949,16 @@ class ShitJournalDailyPlugin(Star):
         sent_history_lookup_by_target: dict[str, set[str]],
         force: bool,
     ) -> list[str]:
-        pending_targets = self._filter_pending_targets(
-            paper_id=paper_id,
-            targets=unresolved_targets,
-            sent_history_lookup_by_target=sent_history_lookup_by_target,
-            force=force,
-        )
-        return [target for target in pending_targets if target not in matched_targets]
+        pending_targets: list[str] = []
+        for session in unresolved_targets:
+            if session in matched_targets:
+                continue
+            if not force:
+                history_lookup = sent_history_lookup_by_target.get(session)
+                if history_lookup is not None and paper_id in history_lookup:
+                    continue
+            pending_targets.append(session)
+        return pending_targets
 
     def _build_run_batch(
         self,
@@ -979,16 +986,53 @@ class ShitJournalDailyPlugin(Star):
         zone: str,
         is_primary: bool,
         offset: int,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | None:
         try:
             return await self._supabase.fetch_latest_submissions(zone, RUN_FETCH_PAGE_SIZE, offset)
         except Exception as exc:
-            self._raise_run_candidate_fetch_error(
+            if self._should_raise_run_candidate_fetch_error(is_primary=is_primary, offset=offset):
+                self._raise_run_candidate_fetch_error(
+                    zone=zone,
+                    is_primary=is_primary,
+                    offset=offset,
+                    error=exc,
+                )
+            self._log_run_candidate_fetch_warning(
                 zone=zone,
                 is_primary=is_primary,
                 offset=offset,
                 error=exc,
             )
+            return None
+
+    def _should_raise_run_candidate_fetch_error(self, *, is_primary: bool, offset: int) -> bool:
+        return is_primary and offset == 0
+
+    def _log_run_candidate_fetch_warning(
+        self,
+        *,
+        zone: str,
+        is_primary: bool,
+        offset: int,
+        error: BaseException,
+    ) -> None:
+        if offset == 0:
+            zone_type = "主分区" if is_primary else "候补分区"
+            logger.warning(
+                "获取%s最新论文失败，已跳过该分区：分区=%s",
+                zone_type,
+                zone,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            return
+        zone_type = "主分区" if is_primary else "候补分区"
+        logger.warning(
+            "获取%s候选页失败，已停止继续检查该分区：分区=%s 偏移=%s",
+            zone_type,
+            zone,
+            offset,
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
     def _raise_run_candidate_fetch_error(
         self,
@@ -1021,21 +1065,36 @@ class ShitJournalDailyPlugin(Star):
             f"{zone_type}缺少 ID：分区={zone} 载荷={meta_preview}",
         )
 
+    def _log_run_candidate_id_warning(
+        self,
+        *,
+        zone: str,
+        candidate: dict[str, Any],
+    ) -> None:
+        logger.warning(
+            "候补分区最新论文缺少 ID，已跳过该分区：分区=%s 载荷=%s",
+            zone,
+            json.dumps(self._build_meta_preview(candidate), ensure_ascii=False),
+        )
+
     def _extract_run_candidate_paper_id(
         self,
         *,
         zone: str,
         candidate: dict[str, Any],
         is_primary: bool,
-    ) -> str:
+    ) -> str | None:
         paper_id = str(candidate.get("id", "")).strip()
         if paper_id:
             return paper_id
-        self._raise_run_candidate_id_error(
-            zone=zone,
-            is_primary=is_primary,
-            candidate=candidate,
-        )
+        if is_primary:
+            self._raise_run_candidate_id_error(
+                zone=zone,
+                is_primary=is_primary,
+                candidate=candidate,
+            )
+        self._log_run_candidate_id_warning(zone=zone, candidate=candidate)
+        return None
 
     async def _send_run_batches(
         self,
@@ -1936,22 +1995,6 @@ class ShitJournalDailyPlugin(Star):
                 self._next_temp_trim_monotonic = 0.0
             raise
 
-    def _filter_pending_targets(
-        self,
-        paper_id: str,
-        targets: list[str],
-        sent_history_lookup_by_target: dict[str, set[str]],
-        force: bool,
-    ) -> list[str]:
-        if force:
-            return targets.copy()
-        pending_targets: list[str] = []
-        for session in targets:
-            history_lookup = sent_history_lookup_by_target.get(session, set())
-            if paper_id not in history_lookup:
-                pending_targets.append(session)
-        return pending_targets
-
     async def _mark_targets_delivered(
         self,
         zone: str,
@@ -1964,9 +2007,11 @@ class ShitJournalDailyPlugin(Star):
         pending_writes: list[tuple[str, list[str]]] = []
         async with self._run_sent_history_lock:
             for session in success_targets:
-                history = list(sent_history_by_target.get(session, []))
-                if not history:
+                history = sent_history_by_target.get(session)
+                if history is None:
                     history = await self._get_run_sent_history_unlocked(zone, session)
+                else:
+                    history = list(history)
                 history = self._prepend_history_item(history, paper_id)
                 sent_history_by_target[session] = history
                 history_lookup = sent_history_lookup_by_target.get(session)

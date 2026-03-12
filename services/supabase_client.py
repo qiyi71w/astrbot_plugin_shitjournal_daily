@@ -46,12 +46,6 @@ class SupabaseClient:
         except Exception:
             logger.warning("关闭 HTTP 客户端失败。", exc_info=True)
 
-    async def fetch_latest_submission(self, zone: str) -> dict[str, Any] | None:
-        latest_list = await self.fetch_latest_submissions(zone=zone, limit=1)
-        if not latest_list:
-            return None
-        return latest_list[0]
-
     async def fetch_latest_submissions(
         self,
         zone: str,
