@@ -11,18 +11,17 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
-from astrbot.api.message_components import File, Image, Plain
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 try:
-    from .services import PdfService, SupabaseClient, TempFileManager
+    from .services import PdfService, PushMessageService, SupabaseClient, TempFileManager
     from .services.sensitive import mask_sensitive_text
 except ImportError:
     _plugin_dir = Path(__file__).resolve().parent
     if str(_plugin_dir) not in sys.path:
         sys.path.insert(0, str(_plugin_dir))
-    from services import PdfService, SupabaseClient, TempFileManager
+    from services import PdfService, PushMessageService, SupabaseClient, TempFileManager
     from services.sensitive import mask_sensitive_text
 
 
@@ -125,6 +124,7 @@ class ShitJournalDailyPlugin(Star):
             default_bucket=DEFAULT_SUPABASE_BUCKET,
         )
         self._pdf_service = PdfService(cfg_int_getter=self._cfg_int)
+        self._push_messages = PushMessageService(cfg_bool_getter=self._cfg_bool)
         self._temp_files = TempFileManager(self._temp_dir, cfg_int_getter=self._cfg_int)
 
     async def initialize(self):
@@ -264,19 +264,27 @@ class ShitJournalDailyPlugin(Star):
             yield event.plain_result(deny_reason)
             return
 
-        success = False
+        apply_success_cooldown = False
         pdf_file: Path | None = None
         png_file: Path | None = None
         try:
             primary_zone = self._get_primary_zone()
             zone_order = self._get_candidate_zones(primary_zone)
-            selected, saw_candidates = await self._select_chi_shi_candidate_from_zones(
+            selected, saw_candidates, selection_warnings = await self._select_chi_shi_candidate_from_zones(
                 zone_order=zone_order,
                 session_key=session_key,
             )
             if not selected:
+                if selection_warnings:
+                    yield event.plain_result(
+                        self._build_chi_shi_failure_text(
+                            saw_candidates=saw_candidates,
+                            warnings=selection_warnings,
+                        ),
+                    )
+                    return
                 if saw_candidates:
-                    success = True
+                    apply_success_cooldown = True
                     yield event.plain_result(
                         f"本群{self._build_zone_scope_text(zone_order)}最近这些论文都推送过了，等下一篇。",
                     )
@@ -293,12 +301,26 @@ class ShitJournalDailyPlugin(Star):
 
             payload = await self._load_submission_payload(candidate, paper_id)
             detail_url = self._build_preprint_detail_url(paper_id)
-            pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
+            pdf_file, png_file, pdf_url = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(payload, detail_url, zone=zone)
-            chain = self._build_push_chain(text, png_file, pdf_file)
+            await self._push_messages.send_event_push(
+                event=event,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            )
             await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
-            yield chain
-            success = True
+            apply_success_cooldown = True
+            if selection_warnings:
+                yield event.plain_result(
+                    self._build_chi_shi_success_text(
+                        requested_zone=primary_zone,
+                        selected_zone=zone,
+                        warnings=selection_warnings,
+                    ),
+                )
+            return
         except Exception as exc:
             logger.error(
                 "“我要赤石”指令执行失败：%s",
@@ -307,7 +329,10 @@ class ShitJournalDailyPlugin(Star):
             )
             yield event.plain_result("抓取失败，请稍后重试。")
         finally:
-            await self._leave_chi_shi_cooldown(session_key=session_key, success=success)
+            await self._leave_chi_shi_cooldown(
+                session_key=session_key,
+                apply_success_cooldown=apply_success_cooldown,
+            )
             await self._temp_files.release(pdf_file, png_file)
             try:
                 await self._maybe_trim_temp_files()
@@ -425,12 +450,16 @@ class ShitJournalDailyPlugin(Star):
             self._chi_shi_group_inflight.add(session_key)
             return True, ""
 
-    async def _leave_chi_shi_cooldown(self, session_key: str, success: bool) -> None:
+    async def _leave_chi_shi_cooldown(
+        self,
+        session_key: str,
+        apply_success_cooldown: bool,
+    ) -> None:
         async with self._chi_shi_cooldown_lock:
             self._chi_shi_group_inflight.discard(session_key)
             cooldown_sec = self._cfg_int("chi_shi_group_cooldown_sec", 60, min_value=0)
             fail_cooldown_sec = self._cfg_int("chi_shi_group_fail_cooldown_sec", 10, min_value=0)
-            effective_cooldown = cooldown_sec if success else fail_cooldown_sec
+            effective_cooldown = cooldown_sec if apply_success_cooldown else fail_cooldown_sec
             if effective_cooldown > 0:
                 self._chi_shi_group_cooldown_until_monotonic[session_key] = (
                     time.monotonic() + effective_cooldown
@@ -542,6 +571,7 @@ class ShitJournalDailyPlugin(Star):
                 "debug_reason": "",
                 "latest_only": latest_only,
                 "batches": [],
+                "warnings": [],
             }
             logger.info(
                 "开始执行推送：来源=%s 主分区=%s 分区顺序=%s 强制=%s 仅最新=%s",
@@ -559,7 +589,7 @@ class ShitJournalDailyPlugin(Star):
 
                 last_seen_map = await self._get_last_seen_map()
                 try:
-                    batches, saw_submission, last_seen_dirty = await self._select_run_batches(
+                    batches, saw_submission, last_seen_dirty, selection_warnings = await self._select_run_batches(
                         zone_order=zone_order,
                         targets=targets,
                         last_seen_map=last_seen_map,
@@ -586,8 +616,16 @@ class ShitJournalDailyPlugin(Star):
                     report["reason_code"] = "FETCH_LATEST_FAILED"
                     report["debug_reason"] = mask_sensitive_text(message)
                     return report
+                report["warnings"] = selection_warnings
 
                 if not batches:
+                    if selection_warnings:
+                        report["status"] = "failed"
+                        report["reason_code"] = "FETCH_LATEST_FAILED"
+                        report["debug_reason"] = self._join_warning_text(selection_warnings)
+                        if last_seen_dirty:
+                            await self.put_kv_data("last_seen_by_zone", last_seen_map)
+                        return report
                     report["status"] = "skipped"
                     report["reason_code"] = "ALREADY_DELIVERED" if saw_submission else "LATEST_NOT_FOUND"
                     if last_seen_dirty:
@@ -629,8 +667,9 @@ class ShitJournalDailyPlugin(Star):
         self,
         zone_order: list[str],
         session_key: str,
-    ) -> tuple[tuple[str, dict[str, Any]] | None, bool]:
+    ) -> tuple[tuple[str, dict[str, Any]] | None, bool, list[str]]:
         saw_candidates = False
+        warnings: list[str] = []
         for index, zone in enumerate(zone_order):
             is_primary = index == 0
             sent_set = set(await self._get_chi_shi_sent_history(zone, session_key))
@@ -644,11 +683,18 @@ class ShitJournalDailyPlugin(Star):
                         offset,
                     )
                 except Exception as exc:
-                    if is_primary:
-                        raise
+                    warnings.append(
+                        self._build_zone_fetch_warning_text(
+                            zone=zone,
+                            is_primary=is_primary,
+                            offset=offset,
+                            error=exc,
+                        ),
+                    )
                     logger.warning(
-                        "获取“我要赤石”候补分区候选论文失败：分区=%s",
+                        "获取“我要赤石”分区候选论文失败，已继续回退下一个分区：分区=%s 偏移=%s",
                         zone,
+                        offset,
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
                     break
@@ -659,13 +705,13 @@ class ShitJournalDailyPlugin(Star):
                 saw_candidates = True
                 candidate = self._pick_first_unsent_candidate(candidates, sent_set)
                 if candidate:
-                    return (zone, candidate), True
+                    return (zone, candidate), True, warnings
 
                 if len(candidates) < CHI_SHI_FETCH_PAGE_SIZE:
                     break
                 offset += len(candidates)
 
-        return None, saw_candidates
+        return None, saw_candidates, warnings
 
     async def _select_run_batches(
         self,
@@ -675,7 +721,7 @@ class ShitJournalDailyPlugin(Star):
         last_seen_map: dict[str, str],
         force: bool,
         latest_only: bool,
-    ) -> tuple[list[dict[str, Any]], bool, bool]:
+    ) -> tuple[list[dict[str, Any]], bool, bool, list[str]]:
         if latest_only:
             return await self._select_latest_only_run_batches(
                 zone_order=zone_order,
@@ -688,15 +734,19 @@ class ShitJournalDailyPlugin(Star):
         last_seen_dirty = False
         unresolved_targets = targets.copy()
         batches: list[dict[str, Any]] = []
+        warnings: list[str] = []
         for index, zone in enumerate(zone_order):
             if not unresolved_targets:
                 break
-            first_page_candidates = await self._fetch_run_candidates_page(
+            first_page_candidates, zone_warnings = await self._fetch_run_candidates_page(
                 zone=zone,
                 is_primary=index == 0,
                 offset=0,
             )
-            zone_batches, matched_targets, zone_saw_submission, zone_last_seen_dirty = (
+            warnings.extend(zone_warnings)
+            if first_page_candidates is None:
+                continue
+            zone_batches, matched_targets, zone_saw_submission, zone_last_seen_dirty, page_warnings = (
                 await self._select_zone_run_batches(
                     zone=zone,
                     is_primary=index == 0,
@@ -706,11 +756,12 @@ class ShitJournalDailyPlugin(Star):
                     first_page_candidates=first_page_candidates,
                 )
             )
+            warnings.extend(page_warnings)
             batches.extend(zone_batches)
             saw_submission = saw_submission or zone_saw_submission
             last_seen_dirty = last_seen_dirty or zone_last_seen_dirty
             unresolved_targets = self._subtract_targets(unresolved_targets, matched_targets)
-        return batches, saw_submission, last_seen_dirty
+        return batches, saw_submission, last_seen_dirty, warnings
 
     async def _select_latest_only_run_batches(
         self,
@@ -719,19 +770,23 @@ class ShitJournalDailyPlugin(Star):
         targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
-    ) -> tuple[list[dict[str, Any]], bool, bool]:
+    ) -> tuple[list[dict[str, Any]], bool, bool, list[str]]:
         saw_submission = False
         last_seen_dirty = False
         unresolved_targets = targets.copy()
         batches: list[dict[str, Any]] = []
+        warnings: list[str] = []
         for index, zone in enumerate(zone_order):
             if not unresolved_targets:
                 break
-            first_page_candidates = await self._fetch_run_candidates_page(
+            first_page_candidates, zone_warnings = await self._fetch_run_candidates_page(
                 zone=zone,
                 is_primary=index == 0,
                 offset=0,
             )
+            warnings.extend(zone_warnings)
+            if first_page_candidates is None:
+                continue
             batch, matched_targets, zone_saw_submission, zone_last_seen_dirty = (
                 await self._select_latest_only_zone_batch(
                     zone=zone,
@@ -747,7 +802,7 @@ class ShitJournalDailyPlugin(Star):
             saw_submission = saw_submission or zone_saw_submission
             last_seen_dirty = last_seen_dirty or zone_last_seen_dirty
             unresolved_targets = self._subtract_targets(unresolved_targets, matched_targets)
-        return batches, saw_submission, last_seen_dirty
+        return batches, saw_submission, last_seen_dirty, warnings
 
     async def _select_zone_run_batches(
         self,
@@ -758,9 +813,9 @@ class ShitJournalDailyPlugin(Star):
         last_seen_map: dict[str, str],
         force: bool,
         first_page_candidates: list[dict[str, Any]] | None,
-    ) -> tuple[list[dict[str, Any]], set[str], bool, bool]:
+    ) -> tuple[list[dict[str, Any]], set[str], bool, bool, list[str]]:
         if not first_page_candidates:
-            return [], set(), False, False
+            return [], set(), False, False, []
         sent_history_by_target = await self._get_run_sent_histories(zone, unresolved_targets)
         sent_history_lookup_by_target = self._build_history_lookup(sent_history_by_target)
         batches: list[dict[str, Any]] = []
@@ -769,13 +824,17 @@ class ShitJournalDailyPlugin(Star):
         last_seen_dirty = False
         zone_latest_recorded = False
         offset = 0
+        warnings: list[str] = []
         while True:
-            candidates = await self._load_run_candidates_page(
+            candidates, page_warnings = await self._load_run_candidates_page(
                 zone=zone,
                 is_primary=is_primary,
                 first_page_candidates=first_page_candidates,
                 offset=offset,
             )
+            warnings.extend(page_warnings)
+            if candidates is None:
+                break
             if not candidates:
                 break
             saw_submission = True
@@ -800,7 +859,7 @@ class ShitJournalDailyPlugin(Star):
             if skip_zone or len(candidates) < RUN_FETCH_PAGE_SIZE or len(matched_targets) == len(unresolved_targets):
                 break
             offset += len(candidates)
-        return batches, matched_targets, saw_submission, last_seen_dirty
+        return batches, matched_targets, saw_submission, last_seen_dirty, warnings
 
     async def _select_latest_only_zone_batch(
         self,
@@ -855,9 +914,9 @@ class ShitJournalDailyPlugin(Star):
         is_primary: bool,
         first_page_candidates: list[dict[str, Any]] | None,
         offset: int,
-    ) -> list[dict[str, Any]] | None:
+    ) -> tuple[list[dict[str, Any]] | None, list[str]]:
         if offset == 0:
-            return first_page_candidates
+            return first_page_candidates, []
         return await self._fetch_run_candidates_page(
             zone=zone,
             is_primary=is_primary,
@@ -986,27 +1045,23 @@ class ShitJournalDailyPlugin(Star):
         zone: str,
         is_primary: bool,
         offset: int,
-    ) -> list[dict[str, Any]] | None:
+    ) -> tuple[list[dict[str, Any]] | None, list[str]]:
         try:
-            return await self._supabase.fetch_latest_submissions(zone, RUN_FETCH_PAGE_SIZE, offset)
+            return await self._supabase.fetch_latest_submissions(zone, RUN_FETCH_PAGE_SIZE, offset), []
         except Exception as exc:
-            if self._should_raise_run_candidate_fetch_error(is_primary=is_primary, offset=offset):
-                self._raise_run_candidate_fetch_error(
-                    zone=zone,
-                    is_primary=is_primary,
-                    offset=offset,
-                    error=exc,
-                )
+            warning = self._build_zone_fetch_warning_text(
+                zone=zone,
+                is_primary=is_primary,
+                offset=offset,
+                error=exc,
+            )
             self._log_run_candidate_fetch_warning(
                 zone=zone,
                 is_primary=is_primary,
                 offset=offset,
                 error=exc,
             )
-            return None
-
-    def _should_raise_run_candidate_fetch_error(self, *, is_primary: bool, offset: int) -> bool:
-        return is_primary and offset == 0
+            return None, [warning]
 
     def _log_run_candidate_fetch_warning(
         self,
@@ -1019,7 +1074,7 @@ class ShitJournalDailyPlugin(Star):
         if offset == 0:
             zone_type = "主分区" if is_primary else "候补分区"
             logger.warning(
-                "获取%s最新论文失败，已跳过该分区：分区=%s",
+                "获取%s最新论文失败，已继续回退后续分区：分区=%s",
                 zone_type,
                 zone,
                 exc_info=(type(error), error, error.__traceback__),
@@ -1027,29 +1082,12 @@ class ShitJournalDailyPlugin(Star):
             return
         zone_type = "主分区" if is_primary else "候补分区"
         logger.warning(
-            "获取%s候选页失败，已停止继续检查该分区：分区=%s 偏移=%s",
+            "获取%s候选页失败，已停止继续检查该分区并回退后续分区：分区=%s 偏移=%s",
             zone_type,
             zone,
             offset,
             exc_info=(type(error), error, error.__traceback__),
         )
-
-    def _raise_run_candidate_fetch_error(
-        self,
-        *,
-        zone: str,
-        is_primary: bool,
-        offset: int,
-        error: BaseException,
-    ) -> None:
-        if offset == 0:
-            zone_type = "主分区首页" if is_primary else "候补分区首页"
-        else:
-            zone_type = "候选页"
-        raise RunSelectionError(
-            "FETCH_LATEST_FAILED",
-            f"获取{zone_type}论文失败：分区={zone} 偏移={offset} 错误={error}",
-        ) from error
 
     def _raise_run_candidate_id_error(
         self,
@@ -1141,7 +1179,7 @@ class ShitJournalDailyPlugin(Star):
                 "论文元数据：%s",
                 json.dumps(self._build_meta_preview(payload), ensure_ascii=False),
             )
-            pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
+            pdf_file, png_file, pdf_url = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(
                 payload,
                 detail_url,
@@ -1152,6 +1190,7 @@ class ShitJournalDailyPlugin(Star):
                 text=text,
                 png_file=png_file,
                 pdf_file=pdf_file,
+                pdf_url=pdf_url,
                 send_semaphore=send_semaphore,
             )
             report["sent_ok"] = sent_ok
@@ -1297,7 +1336,7 @@ class ShitJournalDailyPlugin(Star):
         payload = {**payload, **(detail or {})}
         return payload
 
-    async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path]:
+    async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path, str]:
         pdf_key = str(payload.get("pdf_path") or payload.get("file_path") or "").strip()
         if not pdf_key:
             raise RuntimeError("PDF 路径缺失")
@@ -1347,7 +1386,7 @@ class ShitJournalDailyPlugin(Star):
 
             png_size = png_file.stat().st_size if png_file.exists() else 0
             logger.info("PDF 首页预览图导出完成：文件=%s 字节数=%s", str(png_file), png_size)
-            return pdf_file, png_file
+            return pdf_file, png_file, signed_url
         except Exception:
             await self._temp_files.release(pdf_file, png_file)
             raise
@@ -1358,6 +1397,7 @@ class ShitJournalDailyPlugin(Star):
         text: str,
         png_file: Path,
         pdf_file: Path,
+        pdf_url: str,
         *,
         send_semaphore: asyncio.Semaphore | None = None,
     ) -> tuple[int, list[str]]:
@@ -1367,8 +1407,14 @@ class ShitJournalDailyPlugin(Star):
             ok = False
             async with semaphore:
                 try:
-                    chain = self._build_push_chain(text, png_file, pdf_file)
-                    ok = await self.context.send_message(session, chain)
+                    ok = await self._push_messages.send_session_push(
+                        context=self.context,
+                        session=session,
+                        text=text,
+                        png_file=png_file,
+                        pdf_file=pdf_file,
+                        pdf_url=pdf_url,
+                    )
                 except Exception:
                     logger.error("发送消息失败：会话=%s", session, exc_info=True)
             logger.info("发送消息结果：会话=%s 是否成功=%s", session, ok)
@@ -1391,14 +1437,6 @@ class ShitJournalDailyPlugin(Star):
         success_targets = [session for session, ok in ok_results if ok]
         sent_ok = len(success_targets)
         return sent_ok, success_targets
-
-    def _build_push_chain(self, text: str, png_file: Path, pdf_file: Path) -> MessageEventResult:
-        chain = MessageEventResult()
-        chain.chain.append(Plain(text))
-        chain.chain.append(Image.fromFileSystem(str(png_file)))
-        if self._cfg_bool("send_pdf", False):
-            chain.chain.append(File(name=pdf_file.name, file=str(pdf_file)))
-        return chain
 
     def _build_push_text(
         self,
@@ -2085,6 +2123,60 @@ class ShitJournalDailyPlugin(Star):
         ]
         return {k: payload.get(k) for k in keys}
 
+    def _build_zone_fetch_warning_text(
+        self,
+        *,
+        zone: str,
+        is_primary: bool,
+        offset: int,
+        error: BaseException,
+    ) -> str:
+        zone_type = "主分区" if is_primary else "候补分区"
+        position = "首页" if offset == 0 else f"偏移={offset}"
+        error_text = mask_sensitive_text(str(error).strip()) or type(error).__name__
+        return f"{zone_type}抓取失败：分区={zone} {position} 错误={error_text}"
+
+    def _clean_warning_list(self, raw: Any) -> list[str]:
+        if not isinstance(raw, list):
+            return []
+        warnings: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            text = mask_sensitive_text(str(item).strip())
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            warnings.append(text)
+        return warnings
+
+    def _join_warning_text(self, warnings: list[str]) -> str:
+        return "；".join(self._clean_warning_list(warnings))
+
+    def _append_warning_lines(self, lines: list[str], warnings: list[str]) -> None:
+        for index, warning in enumerate(self._clean_warning_list(warnings), start=1):
+            lines.append(f"告警{index}: {warning}")
+
+    def _build_chi_shi_success_text(
+        self,
+        *,
+        requested_zone: str,
+        selected_zone: str,
+        warnings: list[str],
+    ) -> str:
+        lines = ["已继续回退并完成推送。"]
+        if requested_zone and requested_zone != selected_zone:
+            lines.append(f"最终分区: {selected_zone}")
+        self._append_warning_lines(lines, warnings)
+        return "\n".join(lines)
+
+    def _build_chi_shi_failure_text(self, *, saw_candidates: bool, warnings: list[str]) -> str:
+        if saw_candidates:
+            lines = ["抓取失败：回退过程中存在分区抓取失败，无法确认本群是否都已推送。"]
+        else:
+            lines = ["抓取失败：已尝试所有可回退分区，但未能成功获取可推送论文。"]
+        self._append_warning_lines(lines, warnings)
+        return "\n".join(lines)
+
     def _render_run_mode_text(self, latest_only: bool) -> str:
         if latest_only:
             return "模式: 仅检查最新一篇"
@@ -2119,6 +2211,7 @@ class ShitJournalDailyPlugin(Star):
         latest_only: bool,
         requested_zone: str,
         report_zone: str,
+        warnings: list[str],
         debug_reason: str,
         include_debug: bool,
     ) -> str:
@@ -2127,6 +2220,7 @@ class ShitJournalDailyPlugin(Star):
             lines.append(mode_text)
         if requested_zone and requested_zone != report_zone:
             lines.append(f"请求分区: {requested_zone}")
+        self._append_warning_lines(lines, warnings)
         if include_debug and debug_reason:
             lines.append(f"调试信息: {debug_reason}")
         return "\n".join(lines)
@@ -2139,6 +2233,7 @@ class ShitJournalDailyPlugin(Star):
         reason_text: str,
         latest_only: bool,
         requested_zone: str,
+        warnings: list[str],
         debug_reason: str,
         include_debug: bool,
     ) -> str:
@@ -2160,6 +2255,7 @@ class ShitJournalDailyPlugin(Star):
             latest_only=latest_only,
             requested_zone=requested_zone,
             report_zone=str(report.get("zone", "")).strip(),
+            warnings=warnings,
             debug_reason=debug_reason,
             include_debug=include_debug,
         )
@@ -2171,6 +2267,7 @@ class ShitJournalDailyPlugin(Star):
         reason_text: str,
         latest_only: bool,
         requested_zone: str,
+        warnings: list[str],
         debug_reason: str,
         include_debug: bool,
     ) -> str:
@@ -2185,6 +2282,7 @@ class ShitJournalDailyPlugin(Star):
             latest_only=latest_only,
             requested_zone=requested_zone,
             report_zone=str(report.get("zone", "")).strip(),
+            warnings=warnings,
             debug_reason=debug_reason,
             include_debug=include_debug,
         )
@@ -2195,6 +2293,7 @@ class ShitJournalDailyPlugin(Star):
         debug_reason = mask_sensitive_text(str(report.get("debug_reason", "")).strip())
         latest_only = self._to_bool(report.get("latest_only"), False)
         requested_zone = str(report.get("requested_zone", "")).strip()
+        warnings = self._clean_warning_list(report.get("warnings", []))
         status_text = self._render_status_text(status)
         reason_text = self._render_reason_text(reason_code)
         batches = list(report.get("batches", []))
@@ -2205,6 +2304,7 @@ class ShitJournalDailyPlugin(Star):
                 reason_text=reason_text,
                 latest_only=latest_only,
                 requested_zone=requested_zone,
+                warnings=warnings,
                 debug_reason=debug_reason,
                 include_debug=include_debug,
             )
@@ -2216,6 +2316,7 @@ class ShitJournalDailyPlugin(Star):
                 reason_text=reason_text,
                 latest_only=latest_only,
                 requested_zone=requested_zone,
+                warnings=warnings,
                 debug_reason=debug_reason,
                 include_debug=include_debug,
             )
@@ -2234,6 +2335,7 @@ class ShitJournalDailyPlugin(Star):
             reason_text=reason_text,
             latest_only=latest_only,
             requested_zone=requested_zone,
+            warnings=warnings,
             debug_reason=debug_reason,
             include_debug=include_debug,
         )
