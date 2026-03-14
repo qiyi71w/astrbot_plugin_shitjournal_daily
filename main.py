@@ -11,18 +11,17 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
-from astrbot.api.message_components import File, Image, Plain
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 try:
-    from .services import PdfService, SupabaseClient, TempFileManager
+    from .services import PdfService, PushMessageService, SupabaseClient, TempFileManager
     from .services.sensitive import mask_sensitive_text
 except ImportError:
     _plugin_dir = Path(__file__).resolve().parent
     if str(_plugin_dir) not in sys.path:
         sys.path.insert(0, str(_plugin_dir))
-    from services import PdfService, SupabaseClient, TempFileManager
+    from services import PdfService, PushMessageService, SupabaseClient, TempFileManager
     from services.sensitive import mask_sensitive_text
 
 
@@ -125,6 +124,7 @@ class ShitJournalDailyPlugin(Star):
             default_bucket=DEFAULT_SUPABASE_BUCKET,
         )
         self._pdf_service = PdfService(cfg_int_getter=self._cfg_int)
+        self._push_messages = PushMessageService(cfg_bool_getter=self._cfg_bool)
         self._temp_files = TempFileManager(self._temp_dir, cfg_int_getter=self._cfg_int)
 
     async def initialize(self):
@@ -295,10 +295,15 @@ class ShitJournalDailyPlugin(Star):
             detail_url = self._build_preprint_detail_url(paper_id)
             pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(payload, detail_url, zone=zone)
-            chain = self._build_push_chain(text, png_file, pdf_file)
+            await self._push_messages.send_event_push(
+                event=event,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+            )
             await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
-            yield chain
             success = True
+            return
         except Exception as exc:
             logger.error(
                 "“我要赤石”指令执行失败：%s",
@@ -1367,8 +1372,13 @@ class ShitJournalDailyPlugin(Star):
             ok = False
             async with semaphore:
                 try:
-                    chain = self._build_push_chain(text, png_file, pdf_file)
-                    ok = await self.context.send_message(session, chain)
+                    ok = await self._push_messages.send_session_push(
+                        context=self.context,
+                        session=session,
+                        text=text,
+                        png_file=png_file,
+                        pdf_file=pdf_file,
+                    )
                 except Exception:
                     logger.error("发送消息失败：会话=%s", session, exc_info=True)
             logger.info("发送消息结果：会话=%s 是否成功=%s", session, ok)
@@ -1391,14 +1401,6 @@ class ShitJournalDailyPlugin(Star):
         success_targets = [session for session, ok in ok_results if ok]
         sent_ok = len(success_targets)
         return sent_ok, success_targets
-
-    def _build_push_chain(self, text: str, png_file: Path, pdf_file: Path) -> MessageEventResult:
-        chain = MessageEventResult()
-        chain.chain.append(Plain(text))
-        chain.chain.append(Image.fromFileSystem(str(png_file)))
-        if self._cfg_bool("send_pdf", False):
-            chain.chain.append(File(name=pdf_file.name, file=str(pdf_file)))
-        return chain
 
     def _build_push_text(
         self,

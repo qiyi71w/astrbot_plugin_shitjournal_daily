@@ -4,6 +4,7 @@
 - 推送文本元信息
 - 推送 PDF 第 1 页预览图
 - 可选附带 PDF 原文
+- 可选以群合并转发形式发送上述内容（OneBot v11 群聊）
 
 ## 特性
 - 使用 Supabase API 直接获取最新论文（不依赖 Playwright）
@@ -32,6 +33,7 @@
 - `detail_hide_domain`：开启后“详情”仅显示 `/preprints/xxxx` 路径，默认 `false`
 - `timezone`：默认 `Asia/Shanghai`
 - `target_sessions`：会话列表（UMO）
+- `send_merge_forward`：是否优先使用群合并转发发送，默认 `false`
 - `send_pdf`：是否附 PDF，默认 `false`
 - `pdf_dpi`：转图 DPI，默认 `170`
 - `pdf_max_size_mb`：允许处理的 PDF 最大体积（MB），默认 `50`
@@ -44,6 +46,7 @@
 - `chi_shi_group_fail_cooldown_sec`：`/我要赤石` 失败后冷却秒数，默认 `10`
 - `chi_shi_keep_full_history`：`/我要赤石` 是否全量保留已推送历史，默认 `true`
 - `chi_shi_history_limit`：`/我要赤石` 已推送历史保留上限，默认 `30`，仅在关闭全量保留时生效
+- `pdf_expire_days`：PDF 临时文件过期天数，默认 `0`；仅删除未占用且超时的 PDF，`0` 表示关闭按时间删除
 
 ## 依赖
 `requirements.txt`:
@@ -61,3 +64,6 @@
 - 开启 `schedule_latest_only` 后，定时推送会改为按群只检查各分区最新一篇论文：若某群在主分区最新一篇已推送，则继续检查候补分区最新一篇，不再回补同分区更早论文；`/shitjournal run` 和 `/我要赤石` 仍保持原逻辑。
 - 开启 `detail_hide_domain` 后，定时推送、`/shitjournal run` 的执行结果以及 `/我要赤石` 推送里的“详情”会显示为 `/preprints/xxxx`，不再带 `https://shitjournal.org` 域名。
 - `chi_shi_keep_full_history=true` 时会完整保留每个群、每个分区的已推送历史；关闭后仅保留最近 `chi_shi_history_limit` 条，更省存储，但更早的论文后续会被视为“未推送”。
+- 开启 `send_merge_forward` 后，定时推送、`/shitjournal run` 的论文内容推送以及 `/我要赤石` 会在运行时识别目标是否为 OneBot v11 群聊；命中时将正文、预览图与可选 PDF 放进同一个合并转发消息中，未命中或发送失败时会自动回退为普通消息。
+- 合并转发判定基于平台适配器类型，不依赖 `target_sessions`/`unified_msg_origin` 里的平台实例 ID 命名；即使平台实例 ID 自定义，也无需额外配置。
+- `pdf_expire_days` 只影响 PDF；PNG 预览图仍按 `temp_keep_files` 数量上限清理。

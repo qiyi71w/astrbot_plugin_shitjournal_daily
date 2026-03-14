@@ -45,6 +45,12 @@
     "default": [],
     "hint": "填写 unified_msg_origin，例如 aiocqhttp:GroupMessage:123456"
   },
+  "send_merge_forward": {
+    "description": "是否优先使用群合并转发发送",
+    "type": "bool",
+    "default": false,
+    "hint": "仅在运行时识别到 OneBot v11 群聊时启用；平台实例 ID 可自定义，无需额外配置平台类型；发送失败会自动回退为普通消息"
+  },
   "send_pdf": {
     "description": "是否附带 PDF 文件",
     "type": "bool",
@@ -81,6 +87,12 @@
     "description": "临时文件最多保留数量",
     "type": "int",
     "default": 30
+  },
+  "pdf_expire_days": {
+    "description": "PDF 临时文件过期天数",
+    "type": "int",
+    "default": 0,
+    "hint": "仅删除未占用且超过天数的 PDF；0 表示关闭按时间删除，PNG 仍只按临时文件数量清理"
   },
   "supabase_url": {
     "description": "Supabase API 地址",
