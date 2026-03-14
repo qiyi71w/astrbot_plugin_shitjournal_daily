@@ -69,19 +69,41 @@ class PushMessageService:
         pdf_file: Path,
         pdf_url: str,
     ) -> None:
-        normal_chain = self.build_standard_chain(text, png_file, pdf_file, pdf_url)
+        adapter_name = str(event.get_platform_name()).strip()
         if not self._should_try_merge_forward_for_event(event):
-            await event.send(normal_chain)
+            await self._send_standard_event_push(
+                event=event,
+                adapter_name=adapter_name,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            )
             return
 
         sender_uin = str(event.get_self_id()).strip()
         if not sender_uin:
             logger.warning("事件发送无法获取机器人自身 ID，回退普通消息。")
-            await event.send(normal_chain)
+            await self._send_standard_event_push(
+                event=event,
+                adapter_name=adapter_name,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            )
             return
 
         merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, pdf_url, sender_uin)
-        await self._send_event_with_fallback(event, merge_chain, normal_chain)
+        await self._send_event_with_fallback(
+            event=event,
+            adapter_name=adapter_name,
+            merge_chain=merge_chain,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        )
 
     async def send_session_push(
         self,
@@ -92,22 +114,42 @@ class PushMessageService:
         pdf_file: Path,
         pdf_url: str,
     ) -> bool:
-        normal_chain = self.build_standard_chain(text, png_file, pdf_file, pdf_url)
+        adapter_name = self._resolve_platform_name(context, session)
         platform = self._resolve_merge_forward_platform(context, session)
         if platform is None:
-            return await context.send_message(session, normal_chain)
+            return await self._send_standard_session_push(
+                context=context,
+                session=session,
+                adapter_name=adapter_name,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            )
 
         sender_uin = await self._get_platform_self_id(platform)
         if not sender_uin:
             logger.warning("主动发送无法获取机器人自身 ID，回退普通消息：会话=%s", session)
-            return await context.send_message(session, normal_chain)
+            return await self._send_standard_session_push(
+                context=context,
+                session=session,
+                adapter_name=adapter_name,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            )
 
         merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, pdf_url, sender_uin)
         return await self._send_session_with_fallback(
             context=context,
             session=session,
+            adapter_name=adapter_name,
             merge_chain=merge_chain,
-            normal_chain=normal_chain,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
         )
 
     def _build_push_components(
@@ -184,26 +226,51 @@ class PushMessageService:
                 return platform
         return None
 
+    def _resolve_platform_name(self, context: Any, session: str) -> str:
+        try:
+            message_session = MessageSesion.from_str(session)
+        except Exception:
+            return ""
+        platform = self._find_platform_by_id(context, message_session.platform_name)
+        if platform is None:
+            return ""
+        return str(platform.meta().name)
+
     async def _send_event_with_fallback(
         self,
         event: AstrMessageEvent,
+        adapter_name: str,
         merge_chain: MessageEventResult,
-        normal_chain: MessageEventResult,
+        text: str,
+        png_file: Path,
+        pdf_file: Path,
+        pdf_url: str,
     ) -> None:
         try:
             await event.send(merge_chain)
             return
         except Exception:
             logger.warning("合并转发发送失败，回退普通消息。", exc_info=True)
-        await event.send(normal_chain)
+        await self._send_standard_event_push(
+            event=event,
+            adapter_name=adapter_name,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        )
 
     async def _send_session_with_fallback(
         self,
         *,
         context: Any,
         session: str,
+        adapter_name: str,
         merge_chain: MessageEventResult,
-        normal_chain: MessageEventResult,
+        text: str,
+        png_file: Path,
+        pdf_file: Path,
+        pdf_url: str,
     ) -> bool:
         try:
             merge_ok = await context.send_message(session, merge_chain)
@@ -212,7 +279,93 @@ class PushMessageService:
             logger.warning("合并转发发送返回失败，回退普通消息：会话=%s", session)
         except Exception:
             logger.warning("合并转发发送异常，回退普通消息：会话=%s", session, exc_info=True)
-        return await context.send_message(session, normal_chain)
+        return await self._send_standard_session_push(
+            context=context,
+            session=session,
+            adapter_name=adapter_name,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        )
+
+    async def _send_standard_event_push(
+        self,
+        *,
+        event: AstrMessageEvent,
+        adapter_name: str,
+        text: str,
+        png_file: Path,
+        pdf_file: Path,
+        pdf_url: str,
+    ) -> None:
+        for chain in self._build_standard_chains(
+            adapter_name=adapter_name,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        ):
+            await event.send(chain)
+
+    async def _send_standard_session_push(
+        self,
+        *,
+        context: Any,
+        session: str,
+        adapter_name: str,
+        text: str,
+        png_file: Path,
+        pdf_file: Path,
+        pdf_url: str,
+    ) -> bool:
+        sent_ok = True
+        for chain in self._build_standard_chains(
+            adapter_name=adapter_name,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        ):
+            if not await context.send_message(session, chain):
+                sent_ok = False
+        return sent_ok
+
+    def _build_standard_chains(
+        self,
+        *,
+        adapter_name: str,
+        text: str,
+        png_file: Path,
+        pdf_file: Path,
+        pdf_url: str,
+    ) -> list[MessageEventResult]:
+        if self._should_split_standard_file_send(adapter_name):
+            chains = [self._build_text_image_chain(text, png_file)]
+            file_chain = self._build_pdf_only_chain(pdf_file, pdf_url)
+            if file_chain is not None:
+                chains.append(file_chain)
+            return chains
+        return [self.build_standard_chain(text, png_file, pdf_file, pdf_url)]
+
+    def _build_text_image_chain(self, text: str, png_file: Path) -> MessageEventResult:
+        chain = MessageEventResult()
+        chain.chain.extend([
+            Plain(text),
+            Image.fromFileSystem(str(png_file)),
+        ])
+        return chain
+
+    def _build_pdf_only_chain(self, pdf_file: Path, pdf_url: str) -> MessageEventResult | None:
+        file_component = self._build_pdf_component(pdf_file, pdf_url)
+        if file_component is None:
+            return None
+        chain = MessageEventResult()
+        chain.chain.append(file_component)
+        return chain
+
+    def _should_split_standard_file_send(self, adapter_name: str) -> bool:
+        return adapter_name == ONEBOT_ADAPTER_NAME and self._cfg_bool("send_pdf", False)
 
     async def _get_platform_self_id(self, platform: Any) -> str:
         platform_meta = platform.meta()
