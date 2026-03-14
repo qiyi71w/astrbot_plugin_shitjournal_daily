@@ -65,5 +65,4 @@
 - 开启 `detail_hide_domain` 后，定时推送、`/shitjournal run` 的执行结果以及 `/我要赤石` 推送里的“详情”会显示为 `/preprints/xxxx`，不再带 `https://shitjournal.org` 域名。
 - `chi_shi_keep_full_history=true` 时会完整保留每个群、每个分区的已推送历史；关闭后仅保留最近 `chi_shi_history_limit` 条，更省存储，但更早的论文后续会被视为“未推送”。
 - 开启 `send_merge_forward` 后，定时推送、`/shitjournal run` 的论文内容推送以及 `/我要赤石` 会在运行时识别目标是否为 OneBot v11 群聊；命中时将正文、预览图与可选 PDF 放进同一个合并转发消息中，未命中或发送失败时会自动回退为普通消息。
-- 合并转发判定基于平台适配器类型，不依赖 `target_sessions`/`unified_msg_origin` 里的平台实例 ID 命名；即使平台实例 ID 自定义，也无需额外配置。
 - `pdf_expire_days` 只影响 PDF；PNG 预览图仍按 `temp_keep_files` 数量上限清理。
