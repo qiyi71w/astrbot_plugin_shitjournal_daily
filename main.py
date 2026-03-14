@@ -264,7 +264,7 @@ class ShitJournalDailyPlugin(Star):
             yield event.plain_result(deny_reason)
             return
 
-        success = False
+        apply_success_cooldown = False
         pdf_file: Path | None = None
         png_file: Path | None = None
         try:
@@ -284,7 +284,7 @@ class ShitJournalDailyPlugin(Star):
                     )
                     return
                 if saw_candidates:
-                    success = True
+                    apply_success_cooldown = True
                     yield event.plain_result(
                         f"本群{self._build_zone_scope_text(zone_order)}最近这些论文都推送过了，等下一篇。",
                     )
@@ -311,7 +311,7 @@ class ShitJournalDailyPlugin(Star):
                 pdf_url=pdf_url,
             )
             await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
-            success = True
+            apply_success_cooldown = True
             if selection_warnings:
                 yield event.plain_result(
                     self._build_chi_shi_success_text(
@@ -329,7 +329,10 @@ class ShitJournalDailyPlugin(Star):
             )
             yield event.plain_result("抓取失败，请稍后重试。")
         finally:
-            await self._leave_chi_shi_cooldown(session_key=session_key, success=success)
+            await self._leave_chi_shi_cooldown(
+                session_key=session_key,
+                apply_success_cooldown=apply_success_cooldown,
+            )
             await self._temp_files.release(pdf_file, png_file)
             try:
                 await self._maybe_trim_temp_files()
@@ -447,12 +450,16 @@ class ShitJournalDailyPlugin(Star):
             self._chi_shi_group_inflight.add(session_key)
             return True, ""
 
-    async def _leave_chi_shi_cooldown(self, session_key: str, success: bool) -> None:
+    async def _leave_chi_shi_cooldown(
+        self,
+        session_key: str,
+        apply_success_cooldown: bool,
+    ) -> None:
         async with self._chi_shi_cooldown_lock:
             self._chi_shi_group_inflight.discard(session_key)
             cooldown_sec = self._cfg_int("chi_shi_group_cooldown_sec", 60, min_value=0)
             fail_cooldown_sec = self._cfg_int("chi_shi_group_fail_cooldown_sec", 10, min_value=0)
-            effective_cooldown = cooldown_sec if success else fail_cooldown_sec
+            effective_cooldown = cooldown_sec if apply_success_cooldown else fail_cooldown_sec
             if effective_cooldown > 0:
                 self._chi_shi_group_cooldown_until_monotonic[session_key] = (
                     time.monotonic() + effective_cooldown
@@ -613,6 +620,7 @@ class ShitJournalDailyPlugin(Star):
 
                 if not batches:
                     if selection_warnings:
+                        report["status"] = "failed"
                         report["reason_code"] = "FETCH_LATEST_FAILED"
                         report["debug_reason"] = self._join_warning_text(selection_warnings)
                         if last_seen_dirty:
