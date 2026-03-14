@@ -24,9 +24,10 @@ class PushMessageService:
         text: str,
         png_file: Path,
         pdf_file: Path,
+        pdf_url: str,
     ) -> MessageEventResult:
         chain = MessageEventResult()
-        chain.chain.extend(self._build_push_components(text, png_file, pdf_file))
+        chain.chain.extend(self._build_push_components(text, png_file, pdf_file, pdf_url))
         return chain
 
     def build_merge_forward_chain(
@@ -34,6 +35,7 @@ class PushMessageService:
         text: str,
         png_file: Path,
         pdf_file: Path,
+        pdf_url: str,
         sender_uin: str,
     ) -> MessageEventResult:
         chain = MessageEventResult()
@@ -41,7 +43,7 @@ class PushMessageService:
             Node(
                 name=FORWARD_SENDER_NAME,
                 uin=str(sender_uin),
-                content=self._build_push_components(text, png_file, pdf_file),
+                content=self._build_push_components(text, png_file, pdf_file, pdf_url),
             ),
         )
         return chain
@@ -52,8 +54,9 @@ class PushMessageService:
         text: str,
         png_file: Path,
         pdf_file: Path,
+        pdf_url: str,
     ) -> None:
-        normal_chain = self.build_standard_chain(text, png_file, pdf_file)
+        normal_chain = self.build_standard_chain(text, png_file, pdf_file, pdf_url)
         if not self._should_try_merge_forward_for_event(event):
             await event.send(normal_chain)
             return
@@ -64,7 +67,7 @@ class PushMessageService:
             await event.send(normal_chain)
             return
 
-        merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, sender_uin)
+        merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, pdf_url, sender_uin)
         await self._send_event_with_fallback(event, merge_chain, normal_chain)
 
     async def send_session_push(
@@ -74,8 +77,9 @@ class PushMessageService:
         text: str,
         png_file: Path,
         pdf_file: Path,
+        pdf_url: str,
     ) -> bool:
-        normal_chain = self.build_standard_chain(text, png_file, pdf_file)
+        normal_chain = self.build_standard_chain(text, png_file, pdf_file, pdf_url)
         platform = self._resolve_merge_forward_platform(context, session)
         if platform is None:
             return await context.send_message(session, normal_chain)
@@ -85,7 +89,7 @@ class PushMessageService:
             logger.warning("主动发送无法获取机器人自身 ID，回退普通消息：会话=%s", session)
             return await context.send_message(session, normal_chain)
 
-        merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, sender_uin)
+        merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, pdf_url, sender_uin)
         return await self._send_session_with_fallback(
             context=context,
             session=session,
@@ -98,13 +102,17 @@ class PushMessageService:
         text: str,
         png_file: Path,
         pdf_file: Path,
+        pdf_url: str,
     ) -> list[Any]:
         components: list[Any] = [
             Plain(text),
             Image.fromFileSystem(str(png_file)),
         ]
         if self._cfg_bool("send_pdf", False):
-            components.append(File(name=pdf_file.name, file=str(pdf_file)))
+            if pdf_url:
+                components.append(File(name=pdf_file.name, url=pdf_url))
+            else:
+                components.append(File(name=pdf_file.name, file=str(pdf_file)))
         return components
 
     def _should_try_merge_forward_for_event(self, event: AstrMessageEvent) -> bool:

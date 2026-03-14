@@ -293,13 +293,14 @@ class ShitJournalDailyPlugin(Star):
 
             payload = await self._load_submission_payload(candidate, paper_id)
             detail_url = self._build_preprint_detail_url(paper_id)
-            pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
+            pdf_file, png_file, pdf_url = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(payload, detail_url, zone=zone)
             await self._push_messages.send_event_push(
                 event=event,
                 text=text,
                 png_file=png_file,
                 pdf_file=pdf_file,
+                pdf_url=pdf_url,
             )
             await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
             success = True
@@ -1146,7 +1147,7 @@ class ShitJournalDailyPlugin(Star):
                 "论文元数据：%s",
                 json.dumps(self._build_meta_preview(payload), ensure_ascii=False),
             )
-            pdf_file, png_file = await self._prepare_pdf_assets(payload, paper_id)
+            pdf_file, png_file, pdf_url = await self._prepare_pdf_assets(payload, paper_id)
             text = self._build_push_text(
                 payload,
                 detail_url,
@@ -1157,6 +1158,7 @@ class ShitJournalDailyPlugin(Star):
                 text=text,
                 png_file=png_file,
                 pdf_file=pdf_file,
+                pdf_url=pdf_url,
                 send_semaphore=send_semaphore,
             )
             report["sent_ok"] = sent_ok
@@ -1302,7 +1304,7 @@ class ShitJournalDailyPlugin(Star):
         payload = {**payload, **(detail or {})}
         return payload
 
-    async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path]:
+    async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path, str]:
         pdf_key = str(payload.get("pdf_path") or payload.get("file_path") or "").strip()
         if not pdf_key:
             raise RuntimeError("PDF 路径缺失")
@@ -1352,7 +1354,7 @@ class ShitJournalDailyPlugin(Star):
 
             png_size = png_file.stat().st_size if png_file.exists() else 0
             logger.info("PDF 首页预览图导出完成：文件=%s 字节数=%s", str(png_file), png_size)
-            return pdf_file, png_file
+            return pdf_file, png_file, signed_url
         except Exception:
             await self._temp_files.release(pdf_file, png_file)
             raise
@@ -1363,6 +1365,7 @@ class ShitJournalDailyPlugin(Star):
         text: str,
         png_file: Path,
         pdf_file: Path,
+        pdf_url: str,
         *,
         send_semaphore: asyncio.Semaphore | None = None,
     ) -> tuple[int, list[str]]:
@@ -1378,6 +1381,7 @@ class ShitJournalDailyPlugin(Star):
                         text=text,
                         png_file=png_file,
                         pdf_file=pdf_file,
+                        pdf_url=pdf_url,
                     )
                 except Exception:
                     logger.error("发送消息失败：会话=%s", session, exc_info=True)
