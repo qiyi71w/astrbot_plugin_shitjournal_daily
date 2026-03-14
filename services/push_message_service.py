@@ -12,6 +12,12 @@ from astrbot.core.platform.message_type import MessageType
 
 FORWARD_SENDER_NAME = "S.H.I.T Journal"
 ONEBOT_ADAPTER_NAME = "aiocqhttp"
+SATORI_ADAPTER_NAME = "satori"
+LARK_ADAPTER_NAME = "lark"
+LOCAL_PDF_FILE_ADAPTERS = frozenset({
+    SATORI_ADAPTER_NAME,
+    LARK_ADAPTER_NAME,
+})
 
 
 class PushMessageService:
@@ -21,17 +27,27 @@ class PushMessageService:
 
     def build_standard_chain(
         self,
+        adapter_name: str,
         text: str,
         png_file: Path,
         pdf_file: Path,
         pdf_url: str,
     ) -> MessageEventResult:
         chain = MessageEventResult()
-        chain.chain.extend(self._build_push_components(text, png_file, pdf_file, pdf_url))
+        chain.chain.extend(
+            self._build_push_components(
+                adapter_name=adapter_name,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            ),
+        )
         return chain
 
     def build_merge_forward_chain(
         self,
+        adapter_name: str,
         text: str,
         png_file: Path,
         pdf_file: Path,
@@ -49,7 +65,11 @@ class PushMessageService:
                 ],
             ),
         ]
-        file_component = self._build_pdf_component(pdf_file, pdf_url)
+        file_component = self._build_pdf_component(
+            adapter_name=adapter_name,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        )
         if file_component is not None:
             nodes.append(
                 Node(
@@ -94,7 +114,14 @@ class PushMessageService:
             )
             return
 
-        merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, pdf_url, sender_uin)
+        merge_chain = self.build_merge_forward_chain(
+            adapter_name=adapter_name,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+            sender_uin=sender_uin,
+        )
         await self._send_event_with_fallback(
             event=event,
             adapter_name=adapter_name,
@@ -140,7 +167,14 @@ class PushMessageService:
                 pdf_url=pdf_url,
             )
 
-        merge_chain = self.build_merge_forward_chain(text, png_file, pdf_file, pdf_url, sender_uin)
+        merge_chain = self.build_merge_forward_chain(
+            adapter_name=adapter_name,
+            text=text,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+            sender_uin=sender_uin,
+        )
         return await self._send_session_with_fallback(
             context=context,
             session=session,
@@ -154,6 +188,8 @@ class PushMessageService:
 
     def _build_push_components(
         self,
+        *,
+        adapter_name: str,
         text: str,
         png_file: Path,
         pdf_file: Path,
@@ -163,17 +199,31 @@ class PushMessageService:
             Plain(text),
             Image.fromFileSystem(str(png_file)),
         ]
-        file_component = self._build_pdf_component(pdf_file, pdf_url)
+        file_component = self._build_pdf_component(
+            adapter_name=adapter_name,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        )
         if file_component is not None:
             components.append(file_component)
         return components
 
-    def _build_pdf_component(self, pdf_file: Path, pdf_url: str) -> File | None:
+    def _build_pdf_component(
+        self,
+        *,
+        adapter_name: str,
+        pdf_file: Path,
+        pdf_url: str,
+    ) -> File | None:
         if not self._cfg_bool("send_pdf", False):
             return None
-        if pdf_url:
+        if self._should_use_pdf_url(adapter_name) and pdf_url:
             return File(name=pdf_file.name, url=pdf_url)
         return File(name=pdf_file.name, file=str(pdf_file))
+
+    def _should_use_pdf_url(self, adapter_name: str) -> bool:
+        normalized_adapter_name = str(adapter_name).strip()
+        return normalized_adapter_name not in LOCAL_PDF_FILE_ADAPTERS
 
     def _should_try_merge_forward_for_event(self, event: AstrMessageEvent) -> bool:
         if not self._cfg_bool("send_merge_forward", False):
@@ -342,11 +392,23 @@ class PushMessageService:
     ) -> list[MessageEventResult]:
         if self._should_split_standard_file_send(adapter_name):
             chains = [self._build_text_image_chain(text, png_file)]
-            file_chain = self._build_pdf_only_chain(pdf_file, pdf_url)
+            file_chain = self._build_pdf_only_chain(
+                adapter_name=adapter_name,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            )
             if file_chain is not None:
                 chains.append(file_chain)
             return chains
-        return [self.build_standard_chain(text, png_file, pdf_file, pdf_url)]
+        return [
+            self.build_standard_chain(
+                adapter_name=adapter_name,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            ),
+        ]
 
     def _build_text_image_chain(self, text: str, png_file: Path) -> MessageEventResult:
         chain = MessageEventResult()
@@ -356,8 +418,17 @@ class PushMessageService:
         ])
         return chain
 
-    def _build_pdf_only_chain(self, pdf_file: Path, pdf_url: str) -> MessageEventResult | None:
-        file_component = self._build_pdf_component(pdf_file, pdf_url)
+    def _build_pdf_only_chain(
+        self,
+        adapter_name: str,
+        pdf_file: Path,
+        pdf_url: str,
+    ) -> MessageEventResult | None:
+        file_component = self._build_pdf_component(
+            adapter_name=adapter_name,
+            pdf_file=pdf_file,
+            pdf_url=pdf_url,
+        )
         if file_component is None:
             return None
         chain = MessageEventResult()
