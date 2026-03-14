@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
-from astrbot.api.message_components import File, Image, Node, Plain
+from astrbot.api.message_components import File, Image, Node, Nodes, Plain
 from astrbot.core.platform.message_session import MessageSesion
 from astrbot.core.platform.message_type import MessageType
 
@@ -39,13 +39,26 @@ class PushMessageService:
         sender_uin: str,
     ) -> MessageEventResult:
         chain = MessageEventResult()
-        chain.chain.append(
+        nodes = [
             Node(
                 name=FORWARD_SENDER_NAME,
                 uin=str(sender_uin),
-                content=self._build_push_components(text, png_file, pdf_file, pdf_url),
+                content=[
+                    Plain(text),
+                    Image.fromFileSystem(str(png_file)),
+                ],
             ),
-        )
+        ]
+        file_component = self._build_pdf_component(pdf_file, pdf_url)
+        if file_component is not None:
+            nodes.append(
+                Node(
+                    name=FORWARD_SENDER_NAME,
+                    uin=str(sender_uin),
+                    content=[file_component],
+                ),
+            )
+        chain.chain.append(Nodes(nodes=nodes))
         return chain
 
     async def send_event_push(
@@ -108,12 +121,17 @@ class PushMessageService:
             Plain(text),
             Image.fromFileSystem(str(png_file)),
         ]
-        if self._cfg_bool("send_pdf", False):
-            if pdf_url:
-                components.append(File(name=pdf_file.name, url=pdf_url))
-            else:
-                components.append(File(name=pdf_file.name, file=str(pdf_file)))
+        file_component = self._build_pdf_component(pdf_file, pdf_url)
+        if file_component is not None:
+            components.append(file_component)
         return components
+
+    def _build_pdf_component(self, pdf_file: Path, pdf_url: str) -> File | None:
+        if not self._cfg_bool("send_pdf", False):
+            return None
+        if pdf_url:
+            return File(name=pdf_file.name, url=pdf_url)
+        return File(name=pdf_file.name, file=str(pdf_file))
 
     def _should_try_merge_forward_for_event(self, event: AstrMessageEvent) -> bool:
         if not self._cfg_bool("send_merge_forward", False):
