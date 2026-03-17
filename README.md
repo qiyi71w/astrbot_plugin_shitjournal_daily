@@ -21,7 +21,7 @@
 - `/shitjournal targets`：查看当前目标列表
 - `/shitjournal run`：手动执行一次抓取并推送
 - `/shitjournal run force`：忽略去重强制推送
-- `/我要赤石`：抓取最新论文并推送到当前会话（默认所有人可用；按会话独立去重，已推送会自动回退到更早未推送论文）
+- `/我要赤石`：抓取最新论文并推送到当前会话（默认所有人可用；按会话独立去重，已推送会自动回退到更早未推送论文；AstrBot 管理员可无视会话冷却）
 
 ## 配置
 配置项定义在 `_conf_schema.json`，常用项如下：
@@ -42,7 +42,7 @@
 - `supabase_publishable_key`：Supabase Publishable Key（已内置默认值，可覆盖；也可用环境变量 `SUPABASE_PUBLISHABLE_KEY`）
 - `command_admin_only`：仅管理员可用命令，默认 `true`
 - `command_no_permission_reply`：无权限是否提示，默认 `true`
-- `chi_shi_group_cooldown_sec`：`/我要赤石` 会话冷却秒数，默认 `60`（不同会话独立计时）
+- `chi_shi_group_cooldown_sec`：`/我要赤石` 会话冷却秒数，默认 `60`（不同会话独立计时；AstrBot 管理员触发时不受此冷却限制）
 - `chi_shi_group_fail_cooldown_sec`：`/我要赤石` 失败后冷却秒数，默认 `10`
 - `chi_shi_keep_full_history`：`/我要赤石` 是否全量保留已推送历史，默认 `true`
 - `chi_shi_history_limit`：`/我要赤石` 已推送历史保留上限，默认 `30`，仅在关闭全量保留时生效
