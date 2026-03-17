@@ -496,61 +496,82 @@ class ShitJournalDailyPlugin(Star):
             return
 
         timezone = str(self._cfg("timezone", "Asia/Shanghai")).strip() or "Asia/Shanghai"
-        times = self._normalize_schedule_times(self._cfg("schedule_times", DEFAULT_SCHEDULE_TIMES))
+        times = self._resolve_schedule_times()
         plugin_id = getattr(self, "plugin_id", "shitjournal_daily")
         created_job_ids: list[str] = []
-
-        for idx, time_text in enumerate(times):
-            parsed = self._parse_hhmm(time_text)
-            if parsed is None:
-                logger.warning("已跳过无效的定时时间：%s", time_text)
-                continue
-            hour, minute = parsed
-            cron_expression = f"{minute} {hour} * * *"
-            job = await cron_manager.add_basic_job(
-                name=f"{plugin_id}_shitjournal_{idx}",
-                cron_expression=cron_expression,
-                handler=self._scheduled_tick,
-                description=f"shitjournal 定时推送 {time_text}",
-                timezone=timezone,
-                payload={"schedule_time": time_text},
-                enabled=True,
-                persistent=False,
-            )
-            created_job_ids.append(job.job_id)
-            logger.info(
-                "已注册定时任务：任务ID=%s 时间=%s 表达式=%s 时区=%s",
-                job.job_id,
-                time_text,
-                cron_expression,
-                timezone,
-            )
+        try:
+            for idx, time_text in enumerate(times):
+                parsed = self._parse_hhmm(time_text)
+                if parsed is None:
+                    logger.warning("已跳过无效的定时时间：%s", time_text)
+                    continue
+                hour, minute = parsed
+                cron_expression = f"{minute} {hour} * * *"
+                job = await cron_manager.add_basic_job(
+                    name=f"{plugin_id}_shitjournal_{idx}",
+                    cron_expression=cron_expression,
+                    handler=self._scheduled_tick,
+                    description=f"shitjournal 定时推送 {time_text}",
+                    timezone=timezone,
+                    payload={"schedule_time": time_text},
+                    enabled=True,
+                    persistent=False,
+                )
+                created_job_ids.append(job.job_id)
+                logger.info(
+                    "已注册定时任务：任务ID=%s 时间=%s 表达式=%s 时区=%s",
+                    job.job_id,
+                    time_text,
+                    cron_expression,
+                    timezone,
+                )
+        except Exception:
+            failed_ids = await self._delete_cron_jobs(cron_manager, created_job_ids)
+            self._cron_job_ids = failed_ids
+            await self.put_kv_data("cron_job_ids", failed_ids)
+            raise
 
         self._cron_job_ids = created_job_ids
         await self.put_kv_data("cron_job_ids", created_job_ids)
 
     async def _clear_cron_jobs(self) -> None:
+        ids = await self._load_cron_job_ids()
         cron_manager = getattr(self.context, "cron_manager", None)
         if cron_manager is None:
-            self._cron_job_ids = []
-            await self.put_kv_data("cron_job_ids", [])
+            self._cron_job_ids = ids
+            await self.put_kv_data("cron_job_ids", ids)
             return
 
-        ids = self._cron_job_ids
-        if not ids:
-            loaded = await self.get_kv_data("cron_job_ids", [])
-            if isinstance(loaded, list):
-                ids = [str(i) for i in loaded if str(i).strip()]
+        failed_ids = await self._delete_cron_jobs(cron_manager, ids)
+        self._cron_job_ids = failed_ids
+        await self.put_kv_data("cron_job_ids", failed_ids)
 
+    async def _load_cron_job_ids(self) -> list[str]:
+        ids = [str(job_id).strip() for job_id in self._cron_job_ids if str(job_id).strip()]
+        if ids:
+            return ids
+        loaded = await self.get_kv_data("cron_job_ids", [])
+        if not isinstance(loaded, list):
+            return []
+        return [str(job_id).strip() for job_id in loaded if str(job_id).strip()]
+
+    async def _delete_cron_jobs(self, cron_manager: Any, ids: list[str]) -> list[str]:
+        failed_ids: list[str] = []
         for job_id in ids:
             try:
                 await cron_manager.delete_job(job_id)
                 logger.info("已删除旧定时任务：%s", job_id)
             except Exception:
+                failed_ids.append(job_id)
                 logger.warning("删除定时任务失败，已忽略：%s", job_id, exc_info=True)
+        return failed_ids
 
-        self._cron_job_ids = []
-        await self.put_kv_data("cron_job_ids", [])
+    def _resolve_schedule_times(self) -> list[str]:
+        marker = object()
+        raw = self._cfg("schedule_times", marker)
+        if raw is marker:
+            return DEFAULT_SCHEDULE_TIMES.copy()
+        return self._normalize_schedule_times(raw)
 
     async def _scheduled_tick(self, schedule_time: str = "") -> None:
         report = await self._run_cycle(
@@ -1751,10 +1772,7 @@ class ShitJournalDailyPlugin(Star):
                 continue
             seen.add(formatted)
             normalized.append(formatted)
-
-        if normalized:
-            return normalized
-        return DEFAULT_SCHEDULE_TIMES.copy()
+        return normalized
 
     def _normalize_session_list(self, raw: Any) -> list[str]:
         if not isinstance(raw, list):
