@@ -48,13 +48,13 @@
   "send_merge_forward": {
     "description": "是否优先使用 OneBot v11 合并转发发送",
     "type": "bool",
-    "default": false,
+    "default": true,
     "hint": "启用后QQ会发送合并消息；发送失败会自动回退为普通消息"
   },
   "send_pdf": {
     "description": "是否附带 PDF 文件",
     "type": "bool",
-    "default": false
+    "default": true
   },
   "pdf_dpi": {
     "description": "PDF 第1页转图 DPI",
