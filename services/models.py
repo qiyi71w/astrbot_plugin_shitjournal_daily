@@ -78,8 +78,6 @@ class RunBatch:
     paper_id: str = ""
     detail_url: str = ""
     targets: list[str] = field(default_factory=list)
-    sent_history_by_target: dict[str, list[str]] = field(default_factory=dict)
-    sent_history_lookup_by_target: dict[str, set[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,14 +86,6 @@ class RunBatch:
             "paper_id": self.paper_id,
             "detail_url": self.detail_url,
             "targets": list(self.targets),
-            "sent_history_by_target": {
-                str(key): list(value)
-                for key, value in self.sent_history_by_target.items()
-            },
-            "sent_history_lookup_by_target": {
-                str(key): list(value)
-                for key, value in self.sent_history_lookup_by_target.items()
-            },
         }
 
     @classmethod
@@ -108,14 +98,6 @@ class RunBatch:
             paper_id=str(payload.get("paper_id", "")),
             detail_url=str(payload.get("detail_url", "")),
             targets=[str(item) for item in payload.get("targets", []) or []],
-            sent_history_by_target={
-                str(key): [str(item) for item in (values or [])]
-                for key, values in dict(payload.get("sent_history_by_target", {}) or {}).items()
-            },
-            sent_history_lookup_by_target={
-                str(key): {str(item) for item in (values or [])}
-                for key, values in dict(payload.get("sent_history_lookup_by_target", {}) or {}).items()
-            },
         )
 
 
