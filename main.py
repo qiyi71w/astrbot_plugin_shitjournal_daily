@@ -22,16 +22,10 @@ if __package__:
         PdfService,
         PushMessageService,
         ReportRenderer,
-        RunBatch,
-        RunBatchReport,
         RunBatchSender,
         RunCycleService,
-        RunReason,
         RunReport,
-        RunSelectionResult,
-        RunSelectionError,
         RunSelector,
-        RunStatus,
         SupabaseClient,
         TempFileManager,
     )
@@ -50,16 +44,10 @@ else:
         PdfService,
         PushMessageService,
         ReportRenderer,
-        RunBatch,
-        RunBatchReport,
         RunBatchSender,
         RunCycleService,
-        RunReason,
         RunReport,
-        RunSelectionResult,
-        RunSelectionError,
         RunSelector,
-        RunStatus,
         SupabaseClient,
         TempFileManager,
     )
@@ -273,7 +261,9 @@ class ShitJournalDailyPlugin(Star):
             kv_putter=self.put_kv_data,
             get_cron_job_ids=lambda: list(self._cron_job_ids),
             set_cron_job_ids=self._set_cron_job_ids,
-            scheduled_handler=self._scheduled_tick,
+            scheduled_handler=lambda schedule_time="": self._cron_scheduler.scheduled_tick(
+                schedule_time=schedule_time,
+            ),
             run_cycle=lambda **kwargs: self._run_cycle(**kwargs),
             render_report=lambda report, include_debug=False: self._report_renderer.render_report(
                 report,
@@ -319,13 +309,13 @@ class ShitJournalDailyPlugin(Star):
         )
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         await self._history_store.ensure_chi_shi_history_storage_ready()
-        await self._clear_cron_jobs()
-        await self._register_cron_jobs()
+        await self._cron_scheduler.clear_cron_jobs()
+        await self._cron_scheduler.register_cron_jobs()
         await self._maybe_trim_temp_files(force=True)
         logger.info("shitjournal_daily 插件初始化完成。")
 
     async def terminate(self):
-        await self._clear_cron_jobs()
+        await self._cron_scheduler.clear_cron_jobs()
         await self._supabase.close()
         logger.info("shitjournal_daily 插件已停止。")
 
@@ -337,7 +327,7 @@ class ShitJournalDailyPlugin(Star):
         **kwargs: Any,
     ):
         """管理 shitjournal 每日推送：bind/unbind/targets/run/run force"""
-        normalized = self._normalize_command_event(
+        normalized = self._command_gate.normalize_command_event(
             event=event,
             args=args,
             kwargs=kwargs,
@@ -347,15 +337,15 @@ class ShitJournalDailyPlugin(Star):
             return
         event, args, kwargs = normalized
 
-        if not await self._check_command_permission(event):
+        if not await self._command_gate.check_command_permission(event):
             return
 
-        action, arg = self._parse_command_action_arg(
+        action, arg = self._command_gate.parse_command_action_arg(
             args=args,
             kwargs=kwargs,
             default_action="help",
         )
-        fallback_action, fallback_arg = self._parse_action_arg_from_message(
+        fallback_action, fallback_arg = self._command_gate.parse_action_arg_from_message(
             event=event,
             command_name="shitjournal",
         )
@@ -423,7 +413,7 @@ class ShitJournalDailyPlugin(Star):
     ):
         """抓取最新论文并推送到当前会话（按会话冷却）"""
         # 兼容 AstrBot 不同注入路径下的命令参数形态。
-        normalized = self._normalize_command_event(
+        normalized = self._command_gate.normalize_command_event(
             event=event,
             args=args,
             kwargs=kwargs,
@@ -434,8 +424,8 @@ class ShitJournalDailyPlugin(Star):
         event, _, _ = normalized
         scope_label = self._get_chi_shi_session_scope_text(event)
         session_key = event.unified_msg_origin
-        ignore_cooldown = self._is_admin_event(event)
-        allowed, deny_reason = await self._try_enter_chi_shi_cooldown(
+        ignore_cooldown = self._command_gate.is_admin_event(event)
+        allowed, deny_reason = await self._chi_shi_service.try_enter_chi_shi_cooldown(
             session_key=session_key,
             scope_label=scope_label,
             ignore_cooldown=ignore_cooldown,
@@ -449,7 +439,7 @@ class ShitJournalDailyPlugin(Star):
         pdf_file: Path | None = None
         png_file: Path | None = None
         try:
-            outputs, apply_success_cooldown, pdf_file, png_file = await self._execute_wo_yao_chi_shi(
+            outputs, apply_success_cooldown, pdf_file, png_file = await self._chi_shi_service.execute_wo_yao_chi_shi(
                 event=event,
                 session_key=session_key,
                 scope_label=scope_label,
@@ -462,7 +452,7 @@ class ShitJournalDailyPlugin(Star):
             )
             outputs = ["抓取失败，请稍后重试。"]
         finally:
-            await self._leave_chi_shi_cooldown(
+            await self._chi_shi_service.leave_chi_shi_cooldown(
                 session_key=session_key,
                 apply_success_cooldown=apply_success_cooldown,
                 ignore_cooldown=ignore_cooldown,
@@ -475,73 +465,18 @@ class ShitJournalDailyPlugin(Star):
         for output in outputs:
             yield event.plain_result(output)
 
-    async def _execute_wo_yao_chi_shi(
-        self,
-        *,
-        event: AstrMessageEvent,
-        session_key: str,
-        scope_label: str,
-    ) -> tuple[list[str], bool, Path | None, Path | None]:
-        return await self._chi_shi_service.execute_wo_yao_chi_shi(
-            event=event,
-            session_key=session_key,
-            scope_label=scope_label,
-        )
-
-    def _build_missing_chi_shi_selection_response(
-        self,
-        *,
-        zone_order: list[str],
-        scope_label: str,
-        saw_candidates: bool,
-        selection_warnings: list[str],
-    ) -> tuple[bool, str]:
-        return self._chi_shi_service.build_missing_chi_shi_selection_response(
-            zone_order=zone_order,
-            scope_label=scope_label,
-            saw_candidates=saw_candidates,
-            selection_warnings=selection_warnings,
-        )
-
-    async def _push_chi_shi_selection(
-        self,
-        *,
-        event: AstrMessageEvent,
-        session_key: str,
-        selection: Any,
-    ) -> tuple[bool, Path | None, Path | None]:
-        return await self._chi_shi_service.push_chi_shi_selection(
-            event=event,
-            session_key=session_key,
-            selection=selection,
-        )
-
-    async def _check_command_permission(self, event: AstrMessageEvent) -> bool:
-        return await self._command_gate.check_command_permission(event)
-
-    # 命令兼容层：处理 AstrBot 在不同注入路径下 event/action 参数位置不一致的情况。
-    def _normalize_command_event(
-        self,
-        event: Any,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        command_name: str,
-    ) -> tuple[AstrMessageEvent, tuple[Any, ...], dict[str, Any]] | None:
-        return self._command_gate.normalize_command_event(
-            event=event,
-            args=args,
-            kwargs=kwargs,
-            command_name=command_name,
-        )
-
-    def _looks_like_message_event(self, value: Any) -> bool:
-        return self._command_gate.looks_like_message_event(value)
-
-    def _is_admin_event(self, event: AstrMessageEvent) -> bool:
-        return self._command_gate.is_admin_event(event)
-
-    def _is_sender_in_admins(self, event: AstrMessageEvent) -> bool:
-        return self._command_gate.is_sender_in_admins(event)
+    def __getattr__(self, name: str) -> Any:
+        compatibility_map = {
+            "_register_cron_jobs": lambda: self._cron_scheduler.register_cron_jobs,
+            "_clear_cron_jobs": lambda: self._cron_scheduler.clear_cron_jobs,
+            "_parse_command_action_arg": lambda: self._command_gate.parse_command_action_arg,
+            "_build_chi_shi_failure_text": lambda: self._chi_shi_service.build_chi_shi_failure_text,
+            "_send_run_batches": lambda: self._run_batch_sender.send_run_batches,
+        }
+        getter = compatibility_map.get(name)
+        if getter is None:
+            raise AttributeError(name)
+        return getter()
 
     def _get_chi_shi_session_scope_text(self, event: AstrMessageEvent) -> str:
         if event.get_group_id():
@@ -551,50 +486,8 @@ class ShitJournalDailyPlugin(Star):
             return "当前私聊"
         return "当前会话"
 
-    async def _try_enter_chi_shi_cooldown(
-        self,
-        session_key: str,
-        scope_label: str,
-        ignore_cooldown: bool,
-    ) -> tuple[bool, str]:
-        return await self._chi_shi_service.try_enter_chi_shi_cooldown(
-            session_key=session_key,
-            scope_label=scope_label,
-            ignore_cooldown=ignore_cooldown,
-        )
-
-    async def _leave_chi_shi_cooldown(
-        self,
-        session_key: str,
-        apply_success_cooldown: bool,
-        ignore_cooldown: bool,
-    ) -> None:
-        await self._chi_shi_service.leave_chi_shi_cooldown(
-            session_key=session_key,
-            apply_success_cooldown=apply_success_cooldown,
-            ignore_cooldown=ignore_cooldown,
-        )
-
-    async def _register_cron_jobs(self) -> None:
-        await self._cron_scheduler.register_cron_jobs()
-
-    async def _clear_cron_jobs(self) -> None:
-        await self._cron_scheduler.clear_cron_jobs()
-
-    async def _load_cron_job_ids(self) -> list[str]:
-        return await self._cron_scheduler.load_cron_job_ids()
-
-    async def _delete_cron_jobs(self, cron_manager: Any, ids: list[str]) -> list[str]:
-        return await self._cron_scheduler.delete_cron_jobs(cron_manager, ids)
-
-    def _resolve_schedule_times(self) -> list[str]:
-        return self._cron_scheduler.resolve_schedule_times()
-
     def _set_cron_job_ids(self, ids: list[str]) -> None:
         self._cron_job_ids = [str(job_id).strip() for job_id in ids if str(job_id).strip()]
-
-    async def _scheduled_tick(self, schedule_time: str = "") -> None:
-        await self._cron_scheduler.scheduled_tick(schedule_time=schedule_time)
 
     async def _run_cycle(
         self,
@@ -609,260 +502,6 @@ class ShitJournalDailyPlugin(Star):
             latest_only=latest_only,
         )
 
-    async def _run_cycle_locked(
-        self,
-        *,
-        force: bool,
-        source: str,
-        latest_only: bool,
-    ) -> RunReport:
-        return await self._run_cycle_service.run_cycle(
-            force=force,
-            source=source,
-            latest_only=latest_only,
-        )
-
-    def _build_run_in_progress_report(self, *, source: str, latest_only: bool) -> RunReport:
-        return self._run_cycle_service._build_run_in_progress_report(
-            source=source,
-            latest_only=latest_only,
-        )
-
-    def _build_run_cycle_report(
-        self,
-        *,
-        source: str,
-        primary_zone: str,
-        force: bool,
-        latest_only: bool,
-    ) -> RunReport:
-        return self._run_cycle_service._build_run_cycle_report(
-            source=source,
-            primary_zone=primary_zone,
-            force=force,
-            latest_only=latest_only,
-        )
-
-    async def _select_run_cycle_batches(
-        self,
-        *,
-        report: RunReport,
-        zone_order: list[str],
-        targets: list[str],
-        force: bool,
-        latest_only: bool,
-    ) -> tuple[dict[str, str], RunSelectionResult | None]:
-        return await self._run_cycle_service._select_run_cycle_batches(
-            report=report,
-            zone_order=zone_order,
-            targets=targets,
-            force=force,
-            latest_only=latest_only,
-        )
-
-    def _apply_run_selection_error(
-        self,
-        *,
-        report: RunReport,
-        reason_code: RunReason,
-        message: str,
-    ) -> None:
-        self._run_cycle_service._apply_run_selection_error(report, reason_code, message)
-
-    async def _finalize_empty_run_selection(
-        self,
-        *,
-        report: RunReport,
-        selection: RunSelectionResult,
-        previous_last_seen: dict[str, str],
-    ) -> RunReport:
-        return await self._run_cycle_service._finalize_empty_run_selection(
-            report=report,
-            selection=selection,
-            previous_last_seen=previous_last_seen,
-        )
-
-    async def _deliver_selected_run_batches(
-        self,
-        *,
-        batches: list[RunBatch],
-    ) -> list[RunBatchReport]:
-        return await self._run_cycle_service._deliver_selected_run_batches(batches)
-
-    def _apply_run_batch_reports_to_report(
-        self,
-        *,
-        report: RunReport,
-        batch_reports: list[RunBatchReport],
-        primary_zone: str,
-    ) -> None:
-        self._run_cycle_service._apply_run_batch_reports_to_report(
-            report,
-            batch_reports,
-            primary_zone,
-        )
-
-    async def _persist_last_seen_map_if_changed(
-        self,
-        *,
-        previous_last_seen: dict[str, str],
-        next_last_seen_map: dict[str, str],
-    ) -> None:
-        await self._run_cycle_service._persist_last_seen_map_if_changed(
-            previous_last_seen,
-            next_last_seen_map,
-        )
-
-    async def _send_run_batches(
-        self,
-        batches: list[RunBatch],
-        *,
-        send_semaphore: asyncio.Semaphore | None = None,
-    ) -> list[RunBatchReport | dict[str, Any]]:
-        return await self._run_batch_sender.send_run_batches(
-            batches,
-            send_semaphore=send_semaphore,
-        )
-
-    async def _send_run_batch(
-        self,
-        batch: RunBatch,
-        *,
-        send_semaphore: asyncio.Semaphore | None = None,
-    ) -> RunBatchReport:
-        return await self._run_batch_sender.send_run_batch(
-            batch,
-            send_semaphore=send_semaphore,
-        )
-
-    async def _send_run_batch_inner(
-        self,
-        *,
-        batch: RunBatch,
-        send_semaphore: asyncio.Semaphore | None,
-    ) -> RunBatchReport:
-        return await self._run_batch_sender.send_run_batch_inner(
-            batch=batch,
-            send_semaphore=send_semaphore,
-        )
-
-    def _unpack_run_batch(
-        self,
-        batch: RunBatch,
-    ) -> tuple[str, dict[str, Any], str, str, list[str]]:
-        return (
-            str(batch.zone),
-            dict(batch.latest),
-            str(batch.paper_id),
-            str(batch.detail_url),
-            list(batch.targets),
-        )
-
-    async def _prepare_run_batch_delivery(
-        self,
-        *,
-        latest: dict[str, Any],
-        paper_id: str,
-        detail_url: str,
-        zone: str,
-    ) -> tuple[dict[str, Any], Path | None, Path | None, str, str]:
-        return await self._run_batch_sender.prepare_run_batch_delivery(
-            latest=latest,
-            paper_id=paper_id,
-            detail_url=detail_url,
-            zone=zone,
-        )
-
-    async def _persist_run_batch_success_targets(
-        self,
-        *,
-        zone: str,
-        paper_id: str,
-        success_targets: list[str],
-    ) -> None:
-        await self._run_batch_sender.persist_run_batch_success_targets(
-            zone=zone,
-            paper_id=paper_id,
-            success_targets=success_targets,
-        )
-
-    def _build_run_batch_exception_report(
-        self,
-        *,
-        report: RunBatchReport,
-        zone: str,
-        paper_id: str,
-        error: Exception,
-    ) -> RunBatchReport:
-        return self._run_batch_sender.build_run_batch_exception_report(
-            report=report,
-            zone=zone,
-            paper_id=paper_id,
-            error=error,
-        )
-
-    def _build_run_batch_report(
-        self,
-        *,
-        zone: str,
-        paper_id: str,
-        detail_url: str,
-        sent_total: int,
-    ) -> RunBatchReport:
-        return self._run_batch_sender.build_run_batch_report(
-            zone=zone,
-            paper_id=paper_id,
-            detail_url=detail_url,
-            sent_total=sent_total,
-        )
-
-    def _build_failed_run_batch_report(
-        self,
-        *,
-        report: RunBatchReport,
-        reason_code: RunReason | str,
-        debug_reason: str,
-    ) -> RunBatchReport:
-        return self._run_batch_sender.build_failed_run_batch_report(
-            report=report,
-            reason_code=reason_code,
-            debug_reason=debug_reason,
-        )
-
-    def _resolve_send_status(self, *, sent_ok: int, sent_total: int) -> RunStatus:
-        return self._run_batch_sender.resolve_send_status(
-            sent_ok=sent_ok,
-            sent_total=sent_total,
-        )
-
-    def _resolve_run_batch_reports(
-        self,
-        *,
-        batch_reports: list[RunBatchReport],
-        sent_ok: int,
-        sent_total: int,
-    ) -> tuple[RunStatus, RunReason]:
-        return self._run_batch_sender.resolve_run_batch_reports(
-            batch_reports=batch_reports,
-            sent_ok=sent_ok,
-            sent_total=sent_total,
-        )
-
-    def _resolve_send_reason_code(self, status: RunStatus | str) -> RunReason:
-        return self._run_batch_sender.resolve_send_reason_code(status)
-
-    def _coerce_run_status(self, value: RunStatus | str) -> RunStatus:
-        return self._run_batch_sender.coerce_run_status(value)
-
-    def _coerce_run_reason(self, value: RunReason | str) -> RunReason:
-        return self._run_batch_sender.coerce_run_reason(value)
-
-    def _coerce_run_batch_report(self, value: RunBatchReport | dict[str, Any]) -> RunBatchReport:
-        return self._run_batch_sender.coerce_run_batch_report(value)
-
-    def _resolve_batch_send_concurrency(self, batch_count: int) -> int:
-        return self._run_batch_sender.resolve_batch_send_concurrency(batch_count)
-
     def _get_configured_send_concurrency(self) -> int:
         raw_concurrency = getattr(self, "_send_concurrency", 3)
         try:
@@ -870,9 +509,6 @@ class ShitJournalDailyPlugin(Star):
         except (TypeError, ValueError):
             configured_concurrency = 3
         return min(MAX_SEND_CONCURRENCY, max(1, configured_concurrency))
-
-    def _pick_first_batch_debug_reason(self, batch_reports: list[RunBatchReport]) -> str:
-        return self._run_cycle_service._pick_first_debug_reason(batch_reports)
 
     async def _load_submission_payload(
         self,
@@ -886,25 +522,6 @@ class ShitJournalDailyPlugin(Star):
 
     async def _mark_chi_shi_paper_sent(self, zone: str, session_key: str, paper_id: str) -> None:
         await self._history_store.mark_chi_shi_paper_sent(zone, session_key, paper_id)
-
-    async def _send_push_to_targets(
-        self,
-        targets: list[str],
-        text: str,
-        png_file: Path,
-        pdf_file: Path,
-        pdf_url: str,
-        *,
-        send_semaphore: asyncio.Semaphore | None = None,
-    ) -> tuple[int, list[str]]:
-        return await self._run_batch_sender.send_push_to_targets(
-            targets=targets,
-            text=text,
-            png_file=png_file,
-            pdf_file=pdf_file,
-            pdf_url=pdf_url,
-            send_semaphore=send_semaphore,
-        )
 
     def _build_push_text(
         self,
@@ -937,59 +554,6 @@ class ShitJournalDailyPlugin(Star):
                 f"{SUPABASE_KEY_ENV_NAME}",
             )
         return key
-
-    def _parse_command_action_arg(
-        self,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        default_action: str,
-    ) -> tuple[str, str]:
-        return self._command_gate.parse_command_action_arg(
-            args=args,
-            kwargs=kwargs,
-            default_action=default_action,
-        )
-
-    def _parse_action_arg_from_message(
-        self,
-        event: AstrMessageEvent,
-        command_name: str,
-    ) -> tuple[str, str]:
-        return self._command_gate.parse_action_arg_from_message(
-            event=event,
-            command_name=command_name,
-        )
-
-    def _pick_command_tokens(
-        self,
-        kwargs: dict[str, Any],
-        primary_key: str,
-        alias_key: str,
-        positional_value: Any,
-    ) -> list[str]:
-        if primary_key in kwargs:
-            tokens = self._split_command_tokens(kwargs.get(primary_key))
-            if tokens:
-                return tokens
-        if alias_key in kwargs:
-            tokens = self._split_command_tokens(kwargs.get(alias_key))
-            if tokens:
-                return tokens
-        return self._split_command_tokens(positional_value)
-
-    def _split_command_tokens(self, value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, (list, tuple)):
-            tokens: list[str] = []
-            for item in value:
-                tokens.extend(self._split_command_tokens(item))
-            return tokens
-
-        text = str(value).strip().lower()
-        if not text:
-            return []
-        return [part for part in text.split() if part]
 
     def _cfg(self, key: str, default: Any) -> Any:
         try:
@@ -1083,12 +647,6 @@ class ShitJournalDailyPlugin(Star):
             return "目标分区和候补分区"
         return "目标分区"
 
-    def _parse_hhmm(self, value: str) -> tuple[int, int] | None:
-        return self._cron_scheduler.parse_hhmm(value)
-
-    def _normalize_schedule_times(self, raw: Any) -> list[str]:
-        return self._cron_scheduler.normalize_schedule_times(raw)
-
     def _normalize_session_list(self, raw: Any) -> list[str]:
         if not isinstance(raw, list):
             return []
@@ -1112,62 +670,3 @@ class ShitJournalDailyPlugin(Star):
             async with self._temp_trim_lock:
                 self._next_temp_trim_monotonic = 0.0
             raise
-
-    def _build_zone_fetch_warning_text(
-        self,
-        *,
-        zone: str,
-        is_primary: bool,
-        offset: int,
-        error: BaseException,
-    ) -> str:
-        zone_type = "主分区" if is_primary else "候补分区"
-        position = "首页" if offset == 0 else f"偏移={offset}"
-        error_text = mask_sensitive_text(str(error).strip()) or type(error).__name__
-        return f"{zone_type}抓取失败：分区={zone} {position} 错误={error_text}"
-
-    def _clean_warning_list(self, raw: Any) -> list[str]:
-        if not isinstance(raw, list):
-            return []
-        warnings: list[str] = []
-        seen: set[str] = set()
-        for item in raw:
-            text = mask_sensitive_text(str(item).strip())
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            warnings.append(text)
-        return warnings
-
-    def _join_warning_text(self, warnings: list[str]) -> str:
-        return "；".join(self._clean_warning_list(warnings))
-
-    def _append_warning_lines(self, lines: list[str], warnings: list[str]) -> None:
-        for index, warning in enumerate(self._clean_warning_list(warnings), start=1):
-            lines.append(f"告警{index}: {warning}")
-
-    def _build_chi_shi_success_text(
-        self,
-        *,
-        requested_zone: str,
-        selected_zone: str,
-        warnings: list[str],
-    ) -> str:
-        return self._chi_shi_service.build_chi_shi_success_text(
-            requested_zone=requested_zone,
-            selected_zone=selected_zone,
-            warnings=warnings,
-        )
-
-    def _build_chi_shi_failure_text(
-        self,
-        *,
-        saw_candidates: bool,
-        warnings: list[str],
-        scope_label: str,
-    ) -> str:
-        return self._chi_shi_service.build_chi_shi_failure_text(
-            saw_candidates=saw_candidates,
-            warnings=warnings,
-            scope_label=scope_label,
-        )
