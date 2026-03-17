@@ -6,7 +6,6 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +15,11 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 if __package__:
     from .services import (
+        AssetPipeline,
         HistoryStore,
         PdfService,
         PushMessageService,
+        ReportRenderer,
         RunBatch,
         RunBatchReport,
         RunReason,
@@ -37,9 +38,11 @@ else:
     if str(_plugin_dir) not in sys.path:
         sys.path.insert(0, str(_plugin_dir))
     from services import (
+        AssetPipeline,
         HistoryStore,
         PdfService,
         PushMessageService,
+        ReportRenderer,
         RunBatch,
         RunBatchReport,
         RunReason,
@@ -147,7 +150,12 @@ class ShitJournalDailyPlugin(Star):
             normalize_session_list=self._normalize_session_list,
             normalize_zone_name=self._normalize_zone_name,
         )
-        self._run_selector = RunSelector(
+        self._run_selector = self._create_run_selector()
+        self._asset_pipeline = self._create_asset_pipeline()
+        self._report_renderer = self._create_report_renderer()
+
+    def _create_run_selector(self) -> RunSelector:
+        return RunSelector(
             fetch_latest_submissions=lambda zone, limit, offset: self._supabase.fetch_latest_submissions(
                 zone,
                 limit,
@@ -162,6 +170,34 @@ class ShitJournalDailyPlugin(Star):
                 session_key,
             ),
             logger=logger,
+        )
+
+    def _create_asset_pipeline(self) -> AssetPipeline:
+        return AssetPipeline(
+            fetch_submission_detail=self._supabase.fetch_submission_detail,
+            create_signed_pdf_url=self._supabase.create_signed_pdf_url,
+            download_pdf_file=self._supabase.download_pdf_file,
+            build_output_paths=self._temp_files.build_output_paths,
+            mark_in_use=self._temp_files.mark_in_use,
+            release_temp_files=self._temp_files.release,
+            ensure_pdf_size_limit=self._pdf_service.ensure_pdf_size_limit,
+            export_first_page_png=self._pdf_service.export_first_page_png,
+            logger=logger,
+            mask_sensitive_text=mask_sensitive_text,
+            detail_url_base=DETAIL_URL_BASE,
+            detail_hide_domain=lambda: self._cfg_bool("detail_hide_domain", False),
+            discipline_labels=DISCIPLINE_LABELS,
+            viscosity_labels=VISCOSITY_LABELS,
+            zone_labels=ZONE_LABELS,
+        )
+
+    def _create_report_renderer(self) -> ReportRenderer:
+        return ReportRenderer(
+            status_labels=REPORT_STATUS_LABELS,
+            reason_labels=REPORT_REASON_LABELS,
+            mask_sensitive_text=mask_sensitive_text,
+            detail_url_base=DETAIL_URL_BASE,
+            detail_hide_domain=lambda: self._cfg_bool("detail_hide_domain", False),
         )
 
     async def initialize(self):
@@ -259,7 +295,7 @@ class ShitJournalDailyPlugin(Star):
         if action == "run":
             force = bool(arg) and arg.split()[0] == "force"
             report = await self._run_cycle(force=force, source=f"手动:{event.get_sender_id()}")
-            yield event.plain_result(self._render_report(report))
+            yield event.plain_result(self._report_renderer.render_report(report))
             return
 
         help_text = (
@@ -651,7 +687,7 @@ class ShitJournalDailyPlugin(Star):
             source=f"定时:{schedule_time or '未知'}",
             latest_only=self._cfg_bool("schedule_latest_only", False),
         )
-        logger.info("定时推送执行完成：%s", self._render_report(report, include_debug=True))
+        logger.info("定时推送执行完成：%s", self._report_renderer.render_report(report, include_debug=True))
 
     async def _run_cycle(
         self,
@@ -939,7 +975,10 @@ class ShitJournalDailyPlugin(Star):
         zone: str,
     ) -> tuple[dict[str, Any], Path | None, Path | None, str, str]:
         payload = await self._load_submission_payload(latest, paper_id)
-        logger.info("论文元数据：%s", json.dumps(self._build_meta_preview(payload), ensure_ascii=False))
+        logger.info(
+            "论文元数据：%s",
+            json.dumps(self._asset_pipeline.build_meta_preview(payload), ensure_ascii=False),
+        )
         pdf_file, png_file, pdf_url = await self._prepare_pdf_assets(payload, paper_id)
         text = self._build_push_text(payload, detail_url, zone=zone)
         return payload, pdf_file, png_file, pdf_url, text
@@ -1074,11 +1113,6 @@ class ShitJournalDailyPlugin(Star):
             return value
         return RunBatchReport.from_dict(value)
 
-    def _to_run_report_dict(self, report: RunReport | dict[str, Any]) -> dict[str, Any]:
-        if isinstance(report, RunReport):
-            return report.to_dict()
-        return dict(report)
-
     def _resolve_batch_send_concurrency(self, batch_count: int) -> int:
         return min(MAX_BATCH_SEND_CONCURRENCY, self._get_configured_send_concurrency(), batch_count)
 
@@ -1089,12 +1123,6 @@ class ShitJournalDailyPlugin(Star):
         except (TypeError, ValueError):
             configured_concurrency = 3
         return min(MAX_SEND_CONCURRENCY, max(1, configured_concurrency))
-
-    def _render_status_text(self, status: str) -> str:
-        return REPORT_STATUS_LABELS.get(status, status)
-
-    def _render_reason_text(self, reason_code: str) -> str:
-        return REPORT_REASON_LABELS.get(reason_code, reason_code)
 
     def _pick_first_batch_debug_reason(self, batch_reports: list[RunBatchReport]) -> str:
         for batch_report in batch_reports:
@@ -1108,72 +1136,10 @@ class ShitJournalDailyPlugin(Star):
         latest: dict[str, Any],
         paper_id: str,
     ) -> dict[str, Any]:
-        payload = dict(latest)
-        if str(payload.get("pdf_path") or payload.get("file_path") or "").strip():
-            return payload
-
-        try:
-            detail = await self._supabase.fetch_submission_detail(paper_id)
-        except Exception:
-            logger.warning("获取论文详情失败，将回退为列表页载荷。", exc_info=True)
-            detail = {}
-        payload = {**payload, **(detail or {})}
-        return payload
+        return await self._asset_pipeline.load_submission_payload(latest, paper_id)
 
     async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path, str]:
-        pdf_key = str(payload.get("pdf_path") or payload.get("file_path") or "").strip()
-        if not pdf_key:
-            raise RuntimeError("PDF 路径缺失")
-
-        try:
-            signed_url = await self._supabase.create_signed_pdf_url(pdf_key)
-        except Exception as exc:
-            logger.error(
-                "生成签名 URL 失败：%s",
-                mask_sensitive_text(str(exc)),
-                exc_info=True,
-            )
-            raise RuntimeError("生成签名 URL 失败") from exc
-
-        if not signed_url:
-            raise RuntimeError("签名 URL 为空")
-
-        logger.info("已取得签名 PDF 地址：%s", self._mask_token(signed_url))
-        pdf_file, png_file = self._temp_files.build_output_paths(paper_id)
-        await self._temp_files.mark_in_use(pdf_file, png_file)
-
-        try:
-            try:
-                pdf_status, pdf_type = await self._supabase.download_pdf_file(
-                    signed_url,
-                    pdf_file,
-                )
-                logger.info("PDF 下载完成：状态码=%s 内容类型=%s", pdf_status, pdf_type)
-            except Exception as exc:
-                logger.error(
-                    "下载 PDF 失败：%s",
-                    mask_sensitive_text(str(exc)),
-                    exc_info=True,
-                )
-                raise RuntimeError("下载 PDF 失败") from exc
-
-            self._pdf_service.ensure_pdf_size_limit(pdf_file)
-            try:
-                await asyncio.to_thread(self._pdf_service.export_first_page_png, pdf_file, png_file)
-            except Exception as exc:
-                logger.error(
-                    "导出 PDF 首页预览图失败：%s",
-                    mask_sensitive_text(str(exc)),
-                    exc_info=True,
-                )
-                raise RuntimeError("导出 PDF 首页预览图失败") from exc
-
-            png_size = png_file.stat().st_size if png_file.exists() else 0
-            logger.info("PDF 首页预览图导出完成：文件=%s 字节数=%s", str(png_file), png_size)
-            return pdf_file, png_file, signed_url
-        except Exception:
-            await self._temp_files.release(pdf_file, png_file)
-            raise
+        return await self._asset_pipeline.prepare_pdf_assets(payload, paper_id)
 
     async def _send_push_to_targets(
         self,
@@ -1228,45 +1194,10 @@ class ShitJournalDailyPlugin(Star):
         detail_url: str,
         zone: str = "",
     ) -> str:
-        title = self._fallback_text(payload.get("manuscript_title"))
-        author = self._fallback_text(payload.get("author_name"))
-        institution = self._fallback_text(payload.get("institution"))
-        zone_text = self._format_bilingual_label(zone or payload.get("zone"), ZONE_LABELS)
-        submitted = self._format_datetime(payload.get("created_at"))
-        discipline = self._format_bilingual_label(payload.get("discipline"), DISCIPLINE_LABELS)
-        viscosity = self._format_bilingual_label(payload.get("viscosity"), VISCOSITY_LABELS)
-        avg_score = self._format_number(payload.get("avg_score"))
-        weighted_score = self._format_number(payload.get("weighted_score"))
-        rating_count = self._fallback_text(payload.get("rating_count"))
-        detail_text = self._format_detail_text(detail_url)
-        lines = [
-            "S.H.I.T Journal 论文推送",
-            f"分区: {zone_text}",
-            f"标题: {title}",
-            f"作者: {author}",
-            f"单位: {institution}",
-            f"提交时间: {submitted}",
-            f"学科: {discipline}",
-            f"粘度: {viscosity}",
-            f"评分: 平均={avg_score}, 加权={weighted_score}, 票数={rating_count}",
-            f"详情: {detail_text}",
-        ]
-        return "\n".join(lines)
+        return self._asset_pipeline.build_push_text(payload, detail_url, zone=zone)
 
     def _build_preprint_detail_url(self, paper_id: str) -> str:
-        normalized_paper_id = str(paper_id).strip()
-        return f"{DETAIL_URL_BASE}/preprints/{normalized_paper_id}"
-
-    def _format_detail_text(self, detail_url: str) -> str:
-        detail_text = str(detail_url or "").strip()
-        if not detail_text:
-            return detail_text
-        if not self._cfg_bool("detail_hide_domain", False):
-            return detail_text
-        if detail_text.startswith(DETAIL_URL_BASE):
-            path = detail_text[len(DETAIL_URL_BASE) :].strip()
-            return path if path.startswith("/") else f"/{path}"
-        return detail_text
+        return self._asset_pipeline.build_preprint_detail_url(paper_id)
 
     def _resolve_plugin_data_dir(self) -> Path:
         plugin_name = str(
@@ -1539,65 +1470,6 @@ class ShitJournalDailyPlugin(Star):
                 self._next_temp_trim_monotonic = 0.0
             raise
 
-    def _format_datetime(self, value: Any) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return "无"
-        try:
-            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return text
-
-    def _format_number(self, value: Any) -> str:
-        if value is None or value == "":
-            return "无"
-        try:
-            return f"{float(value):.4f}"
-        except Exception:
-            return str(value)
-
-    def _fallback_text(self, value: Any) -> str:
-        text = str(value or "").strip()
-        return text if text else "无"
-
-    def _format_bilingual_label(
-        self,
-        raw_value: Any,
-        mapping: dict[str, tuple[str, str]],
-    ) -> str:
-        text = str(raw_value or "").strip()
-        if not text:
-            return "无"
-        key = text.lower()
-        if key in mapping:
-            cn, en = mapping[key]
-            return f"{cn} / {en}"
-        return text
-
-    def _mask_token(self, url: str) -> str:
-        if "token=" not in url:
-            return url
-        head, _, _ = url.partition("token=")
-        return head + "token=<已隐藏>"
-
-    def _build_meta_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
-        keys = [
-            "id",
-            "manuscript_title",
-            "author_name",
-            "institution",
-            "discipline",
-            "viscosity",
-            "created_at",
-            "avg_score",
-            "rating_count",
-            "weighted_score",
-            "pdf_path",
-            "zone",
-        ]
-        return {k: payload.get(k) for k in keys}
-
     def _build_zone_fetch_warning_text(
         self,
         *,
@@ -1657,167 +1529,3 @@ class ShitJournalDailyPlugin(Star):
             lines = ["抓取失败：已尝试所有可回退分区，但未能成功获取可推送论文。"]
         self._append_warning_lines(lines, warnings)
         return "\n".join(lines)
-
-    def _render_run_mode_text(self, latest_only: bool) -> str:
-        if latest_only:
-            return "模式: 仅检查最新一篇"
-        return ""
-
-    def _render_report_header(self, status_text: str, reason_text: str) -> list[str]:
-        return [
-            f"[shitjournal 执行结果] 状态: {status_text}",
-            f"原因: {reason_text}",
-        ]
-
-    def _render_report_batch_line(self, index: int, batch: dict[str, Any]) -> list[str]:
-        detail_text = self._format_detail_text(str(batch.get("detail_url", "")))
-        batch_status = str(batch.get("status", "unknown") or "unknown")
-        batch_status_text = self._render_status_text(batch_status)
-        batch_reason_code = str(batch.get("reason_code", "")).strip()
-        batch_reason_text = self._render_reason_text(batch_reason_code) if batch_reason_code else ""
-        suffix = f" 原因={batch_reason_text}" if batch_status == "failed" and batch_reason_text else ""
-        return [
-            (
-                f"第{index}批: 状态={batch_status_text} 分区={batch.get('zone', '')} "
-                f"论文ID={batch.get('paper_id', '')} "
-                f"推送={batch.get('sent_ok', 0)}/{batch.get('sent_total', 0)} "
-                f"详情={detail_text}{suffix}"
-            ),
-        ]
-
-    def _append_report_suffix(
-        self,
-        *,
-        lines: list[str],
-        latest_only: bool,
-        requested_zone: str,
-        report_zone: str,
-        warnings: list[str],
-        debug_reason: str,
-        include_debug: bool,
-    ) -> str:
-        mode_text = self._render_run_mode_text(latest_only)
-        if mode_text:
-            lines.append(mode_text)
-        if requested_zone and requested_zone != report_zone:
-            lines.append(f"请求分区: {requested_zone}")
-        self._append_warning_lines(lines, warnings)
-        if include_debug and debug_reason:
-            lines.append(f"调试信息: {debug_reason}")
-        return "\n".join(lines)
-
-    def _render_single_batch_report(
-        self,
-        report: dict[str, Any],
-        batch: dict[str, Any],
-        status_text: str,
-        reason_text: str,
-        latest_only: bool,
-        requested_zone: str,
-        warnings: list[str],
-        debug_reason: str,
-        include_debug: bool,
-    ) -> str:
-        lines = self._render_report_header(status_text, reason_text)
-        batch_reason_code = str(batch.get("reason_code", "")).strip()
-        lines.extend(
-            [
-                f"批次状态: {self._render_status_text(str(batch.get('status', 'unknown') or 'unknown'))}",
-                f"分区: {batch.get('zone', '')}",
-                f"论文 ID: {batch.get('paper_id', '')}",
-                f"推送: {batch.get('sent_ok', 0)}/{batch.get('sent_total', 0)}",
-                f"详情: {self._format_detail_text(str(batch.get('detail_url', '')))}",
-            ]
-        )
-        if batch_reason_code and batch_reason_code != "PUSHED_SUCCESSFULLY":
-            lines.append(f"批次原因: {self._render_reason_text(batch_reason_code)}")
-        return self._append_report_suffix(
-            lines=lines,
-            latest_only=latest_only,
-            requested_zone=requested_zone,
-            report_zone=str(report.get("zone", "")).strip(),
-            warnings=warnings,
-            debug_reason=debug_reason,
-            include_debug=include_debug,
-        )
-
-    def _render_multi_batch_report(
-        self,
-        report: dict[str, Any],
-        status_text: str,
-        reason_text: str,
-        latest_only: bool,
-        requested_zone: str,
-        warnings: list[str],
-        debug_reason: str,
-        include_debug: bool,
-    ) -> str:
-        batches = list(report.get("batches", []))
-        lines = self._render_report_header(status_text, reason_text)
-        lines.append(f"总批次: {len(batches)}")
-        lines.append(f"总推送: {report.get('sent_ok', 0)}/{report.get('sent_total', 0)}")
-        for index, batch in enumerate(batches, start=1):
-            lines.extend(self._render_report_batch_line(index, batch))
-        return self._append_report_suffix(
-            lines=lines,
-            latest_only=latest_only,
-            requested_zone=requested_zone,
-            report_zone=str(report.get("zone", "")).strip(),
-            warnings=warnings,
-            debug_reason=debug_reason,
-            include_debug=include_debug,
-        )
-
-    def _render_report(self, report: RunReport | dict[str, Any], include_debug: bool = False) -> str:
-        report_dict = self._to_run_report_dict(report)
-        status = str(report_dict.get("status", "unknown") or "unknown")
-        reason_code = str(report_dict.get("reason_code") or report_dict.get("reason") or "UNKNOWN")
-        debug_reason = mask_sensitive_text(str(report_dict.get("debug_reason", "")).strip())
-        latest_only = self._to_bool(report_dict.get("latest_only"), False)
-        requested_zone = str(report_dict.get("requested_zone", "")).strip()
-        warnings = self._clean_warning_list(report_dict.get("warnings", []))
-        status_text = self._render_status_text(status)
-        reason_text = self._render_reason_text(reason_code)
-        batches = list(report_dict.get("batches", []))
-        if len(batches) > 1:
-            return self._render_multi_batch_report(
-                report=report_dict,
-                status_text=status_text,
-                reason_text=reason_text,
-                latest_only=latest_only,
-                requested_zone=requested_zone,
-                warnings=warnings,
-                debug_reason=debug_reason,
-                include_debug=include_debug,
-            )
-        if len(batches) == 1:
-            return self._render_single_batch_report(
-                report=report_dict,
-                batch=batches[0],
-                status_text=status_text,
-                reason_text=reason_text,
-                latest_only=latest_only,
-                requested_zone=requested_zone,
-                warnings=warnings,
-                debug_reason=debug_reason,
-                include_debug=include_debug,
-            )
-        empty_batch = {
-            "status": str(report_dict.get("status", "unknown") or "unknown"),
-            "zone": str(report_dict.get("zone", "")).strip(),
-            "paper_id": str(report_dict.get("paper_id", "")).strip(),
-            "detail_url": str(report_dict.get("detail_url", "")).strip(),
-            "sent_ok": report_dict.get("sent_ok", 0),
-            "sent_total": report_dict.get("sent_total", 0),
-        }
-        return self._render_single_batch_report(
-            report=report_dict,
-            batch=empty_batch,
-            status_text=status_text,
-            reason_text=reason_text,
-            latest_only=latest_only,
-            requested_zone=requested_zone,
-            warnings=warnings,
-            debug_reason=debug_reason,
-            include_debug=include_debug,
-        )
