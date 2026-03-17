@@ -16,12 +16,14 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 try:
     from .services import PdfService, PushMessageService, SupabaseClient, TempFileManager
+    from .services.session_message import is_private_message_session
     from .services.sensitive import mask_sensitive_text
 except ImportError:
     _plugin_dir = Path(__file__).resolve().parent
     if str(_plugin_dir) not in sys.path:
         sys.path.insert(0, str(_plugin_dir))
     from services import PdfService, PushMessageService, SupabaseClient, TempFileManager
+    from services.session_message import is_private_message_session
     from services.sensitive import mask_sensitive_text
 
 
@@ -94,7 +96,7 @@ class RunSelectionError(RuntimeError):
 @register(
     "astrbot_plugin_shitjournal_daily",
     "AstrBot",
-    "定时推送 shitjournal 最新论文到群聊",
+    "定时推送 shitjournal 最新论文到会话",
     "1.0.0",
 )
 class ShitJournalDailyPlugin(Star):
@@ -242,7 +244,7 @@ class ShitJournalDailyPlugin(Star):
         *args: Any,
         **kwargs: Any,
     ):
-        """抓取最新论文并推送到当前群聊（按群冷却）"""
+        """抓取最新论文并推送到当前会话（按会话冷却）"""
         # 兼容 AstrBot 不同注入路径下的命令参数形态。
         normalized = self._normalize_command_event(
             event=event,
@@ -253,13 +255,14 @@ class ShitJournalDailyPlugin(Star):
         if not normalized:
             return
         event, _, _ = normalized
-
-        if not event.get_group_id():
-            yield event.plain_result("该指令仅支持群聊。")
-            return
-
+        scope_label = self._get_chi_shi_session_scope_text(event)
         session_key = event.unified_msg_origin
-        allowed, deny_reason = await self._try_enter_chi_shi_cooldown(session_key=session_key)
+        ignore_cooldown = self._is_admin_event(event)
+        allowed, deny_reason = await self._try_enter_chi_shi_cooldown(
+            session_key=session_key,
+            scope_label=scope_label,
+            ignore_cooldown=ignore_cooldown,
+        )
         if not allowed:
             yield event.plain_result(deny_reason)
             return
@@ -280,13 +283,14 @@ class ShitJournalDailyPlugin(Star):
                         self._build_chi_shi_failure_text(
                             saw_candidates=saw_candidates,
                             warnings=selection_warnings,
+                            scope_label=scope_label,
                         ),
                     )
                     return
                 if saw_candidates:
                     apply_success_cooldown = True
                     yield event.plain_result(
-                        f"本群{self._build_zone_scope_text(zone_order)}最近这些论文都推送过了，等下一篇。",
+                        f"{scope_label}{self._build_zone_scope_text(zone_order)}最近这些论文都推送过了，等下一篇。",
                     )
                     return
                 yield event.plain_result("未找到最新论文。")
@@ -332,6 +336,7 @@ class ShitJournalDailyPlugin(Star):
             await self._leave_chi_shi_cooldown(
                 session_key=session_key,
                 apply_success_cooldown=apply_success_cooldown,
+                ignore_cooldown=ignore_cooldown,
             )
             await self._temp_files.release(pdf_file, png_file)
             try:
@@ -349,10 +354,7 @@ class ShitJournalDailyPlugin(Star):
 
         if not self._cfg_bool("command_admin_only", True):
             return True
-        is_admin = getattr(event, "is_admin", None)
-        if callable(is_admin) and is_admin():
-            return True
-        if self._is_sender_in_admins(event):
+        if self._is_admin_event(event):
             return True
         if self._cfg_bool("command_no_permission_reply", True):
             await event.send(event.plain_result("权限不足：仅管理员可使用该指令。"))
@@ -413,6 +415,12 @@ class ShitJournalDailyPlugin(Star):
             and callable(getattr(value, "get_sender_id", None))
         )
 
+    def _is_admin_event(self, event: AstrMessageEvent) -> bool:
+        is_admin = getattr(event, "is_admin", None)
+        if callable(is_admin) and is_admin():
+            return True
+        return self._is_sender_in_admins(event)
+
     def _is_sender_in_admins(self, event: AstrMessageEvent) -> bool:
         sender_id = str(event.get_sender_id()).strip()
         if not sender_id:
@@ -433,19 +441,30 @@ class ShitJournalDailyPlugin(Star):
         admins = {item for item in normalized_admins if item}
         return sender_id in admins
 
+    def _get_chi_shi_session_scope_text(self, event: AstrMessageEvent) -> str:
+        if event.get_group_id():
+            return "本群"
+        session_key = str(getattr(event, "unified_msg_origin", "")).strip()
+        if is_private_message_session(session_key):
+            return "当前私聊"
+        return "当前会话"
+
     async def _try_enter_chi_shi_cooldown(
         self,
         session_key: str,
+        scope_label: str,
+        ignore_cooldown: bool,
     ) -> tuple[bool, str]:
         async with self._chi_shi_cooldown_lock:
             if session_key in self._chi_shi_group_inflight:
-                return False, "本群已有赤石任务在执行，请稍后再试。"
+                return False, f"{scope_label}已有赤石任务在执行，请稍后再试。"
 
-            now = time.monotonic()
-            cooldown_until = float(self._chi_shi_group_cooldown_until_monotonic.get(session_key, 0.0))
-            remaining = cooldown_until - now
-            if remaining > 0:
-                return False, f"本群冷却中，请 {int(remaining + 0.999)} 秒后再试。"
+            if not ignore_cooldown:
+                now = time.monotonic()
+                cooldown_until = float(self._chi_shi_group_cooldown_until_monotonic.get(session_key, 0.0))
+                remaining = cooldown_until - now
+                if remaining > 0:
+                    return False, f"{scope_label}冷却中，请 {int(remaining + 0.999)} 秒后再试。"
 
             self._chi_shi_group_inflight.add(session_key)
             return True, ""
@@ -454,9 +473,12 @@ class ShitJournalDailyPlugin(Star):
         self,
         session_key: str,
         apply_success_cooldown: bool,
+        ignore_cooldown: bool,
     ) -> None:
         async with self._chi_shi_cooldown_lock:
             self._chi_shi_group_inflight.discard(session_key)
+            if ignore_cooldown:
+                return
             cooldown_sec = self._cfg_int("chi_shi_group_cooldown_sec", 60, min_value=0)
             fail_cooldown_sec = self._cfg_int("chi_shi_group_fail_cooldown_sec", 10, min_value=0)
             effective_cooldown = cooldown_sec if apply_success_cooldown else fail_cooldown_sec
@@ -2169,9 +2191,15 @@ class ShitJournalDailyPlugin(Star):
         self._append_warning_lines(lines, warnings)
         return "\n".join(lines)
 
-    def _build_chi_shi_failure_text(self, *, saw_candidates: bool, warnings: list[str]) -> str:
+    def _build_chi_shi_failure_text(
+        self,
+        *,
+        saw_candidates: bool,
+        warnings: list[str],
+        scope_label: str,
+    ) -> str:
         if saw_candidates:
-            lines = ["抓取失败：回退过程中存在分区抓取失败，无法确认本群是否都已推送。"]
+            lines = [f"抓取失败：回退过程中存在分区抓取失败，无法确认{scope_label}是否都已推送。"]
         else:
             lines = ["抓取失败：已尝试所有可回退分区，但未能成功获取可推送论文。"]
         self._append_warning_lines(lines, warnings)
