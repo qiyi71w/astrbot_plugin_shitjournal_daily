@@ -4,10 +4,10 @@
 - 推送文本元信息
 - 推送 PDF 第 1 页预览图
 - 可选附带 PDF 原文
-- 可选以合并转发形式发送上述内容（OneBot v11 群聊/私聊）
+- 可选以合并转发形式发送论文内容（OneBot v11 群聊/私聊；群聊可把 PDF 一并放进合并转发，私聊会单独补发 PDF）
 
 ## 特性
-- 使用 Supabase API 直接获取最新论文（不依赖 Playwright）
+- 使用 Supabase API 直接获取最新论文
 - 多时点定时任务（每日多个 `HH:MM`）
 - 定时自动推送可切换为“只检查最新一篇论文”
 - 去重推送（按 `zone + paper_id`，已推送会自动回退到下一篇未推送论文）
@@ -64,5 +64,5 @@
 - 开启 `schedule_latest_only` 后，定时推送会改为按会话只检查各分区最新一篇论文：若某个会话在主分区最新一篇已推送，则继续检查候补分区最新一篇，不再回补同分区更早论文；`/shitjournal run` 和 `/我要赤石` 仍保持原逻辑。
 - 开启 `detail_hide_domain` 后，定时推送、`/shitjournal run` 的执行结果以及 `/我要赤石` 推送里的“详情”会显示为 `/preprints/xxxx`，不再带 `https://shitjournal.org` 域名。
 - `chi_shi_keep_full_history=true` 时会完整保留每个会话、每个分区的已推送历史；关闭后仅保留最近 `chi_shi_history_limit` 条，更省存储，但更早的论文后续会被视为“未推送”。
-- 开启 `send_merge_forward` 后，定时推送、`/shitjournal run` 的论文内容推送以及 `/我要赤石` 会在运行时识别目标是否为 OneBot v11 群聊或私聊；命中时将正文、预览图与可选 PDF 放进同一个合并转发消息中，未命中或发送失败时会自动回退为普通消息。
+- 开启 `send_merge_forward` 后，定时推送、`/shitjournal run` 的论文内容推送以及 `/我要赤石` 会在运行时识别目标是否为 OneBot v11 群聊或私聊；群聊命中时会把正文、预览图与可选 PDF 放进同一个合并转发消息中，私聊命中时会把正文与预览图放进合并转发消息，并在启用 PDF 时紧接着补发一个普通 PDF 文件消息，未命中或发送失败时会自动回退为普通消息。
 - `pdf_expire_days` 只影响 PDF；PNG 预览图仍按 `temp_keep_files` 数量上限清理。
