@@ -14,15 +14,35 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-try:
-    from .services import PdfService, PushMessageService, SupabaseClient, TempFileManager
+if __package__:
+    from .services import (
+        PdfService,
+        PushMessageService,
+        RunBatch,
+        RunBatchReport,
+        RunReason,
+        RunReport,
+        RunStatus,
+        SupabaseClient,
+        TempFileManager,
+    )
     from .services.session_message import is_private_message_session
     from .services.sensitive import mask_sensitive_text
-except ImportError:
+else:
     _plugin_dir = Path(__file__).resolve().parent
     if str(_plugin_dir) not in sys.path:
         sys.path.insert(0, str(_plugin_dir))
-    from services import PdfService, PushMessageService, SupabaseClient, TempFileManager
+    from services import (
+        PdfService,
+        PushMessageService,
+        RunBatch,
+        RunBatchReport,
+        RunReason,
+        RunReport,
+        RunStatus,
+        SupabaseClient,
+        TempFileManager,
+    )
     from services.session_message import is_private_message_session
     from services.sensitive import mask_sensitive_text
 
@@ -587,35 +607,27 @@ class ShitJournalDailyPlugin(Star):
         force: bool,
         source: str,
         latest_only: bool = False,
-    ) -> dict[str, Any]:
+    ) -> RunReport:
         if self._run_lock.locked():
-            return {
-                "status": "skipped",
-                "reason_code": "RUN_IN_PROGRESS",
-                "source": source,
-                "debug_reason": "",
-                "latest_only": latest_only,
-            }
+            return RunReport(
+                status=RunStatus.SKIPPED,
+                reason_code=RunReason.RUN_IN_PROGRESS,
+                source=source,
+                debug_reason="",
+                latest_only=latest_only,
+            )
 
         async with self._run_lock:
             primary_zone = self._get_primary_zone()
             zone_order = self._get_candidate_zones(primary_zone)
-            report: dict[str, Any] = {
-                "status": "failed",
-                "source": source,
-                "zone": primary_zone,
-                "requested_zone": primary_zone,
-                "force": force,
-                "paper_id": "",
-                "detail_url": "",
-                "sent_ok": 0,
-                "sent_total": 0,
-                "reason_code": "",
-                "debug_reason": "",
-                "latest_only": latest_only,
-                "batches": [],
-                "warnings": [],
-            }
+            report = RunReport(
+                status=RunStatus.FAILED,
+                source=source,
+                zone=primary_zone,
+                requested_zone=primary_zone,
+                force=force,
+                latest_only=latest_only,
+            )
             logger.info(
                 "开始执行推送：来源=%s 主分区=%s 分区顺序=%s 强制=%s 仅最新=%s",
                 source,
@@ -627,7 +639,7 @@ class ShitJournalDailyPlugin(Star):
             try:
                 targets = await self._get_all_target_sessions()
                 if not targets:
-                    report["reason_code"] = "NO_TARGET_SESSION_CONFIGURED"
+                    report.reason_code = RunReason.NO_TARGET_SESSION_CONFIGURED
                     return report
 
                 last_seen_map = await self._get_last_seen_map()
@@ -641,13 +653,13 @@ class ShitJournalDailyPlugin(Star):
                     )
                 except RunSelectionError as exc:
                     message = str(exc).strip()
-                    report["reason_code"] = exc.reason_code
+                    report.reason_code = self._coerce_run_reason(exc.reason_code)
                     logger.error(
                         "获取最新论文失败：%s",
                         mask_sensitive_text(message),
                         exc_info=True,
                     )
-                    report["debug_reason"] = mask_sensitive_text(message)
+                    report.debug_reason = mask_sensitive_text(message)
                     return report
                 except RuntimeError as exc:
                     message = str(exc).strip()
@@ -656,48 +668,51 @@ class ShitJournalDailyPlugin(Star):
                         mask_sensitive_text(message),
                         exc_info=True,
                     )
-                    report["reason_code"] = "FETCH_LATEST_FAILED"
-                    report["debug_reason"] = mask_sensitive_text(message)
+                    report.reason_code = RunReason.FETCH_LATEST_FAILED
+                    report.debug_reason = mask_sensitive_text(message)
                     return report
-                report["warnings"] = selection_warnings
+                report.warnings = selection_warnings
 
                 if not batches:
                     if selection_warnings:
-                        report["status"] = "failed"
-                        report["reason_code"] = "FETCH_LATEST_FAILED"
-                        report["debug_reason"] = self._join_warning_text(selection_warnings)
+                        report.status = RunStatus.FAILED
+                        report.reason_code = RunReason.FETCH_LATEST_FAILED
+                        report.debug_reason = self._join_warning_text(selection_warnings)
                         if last_seen_dirty:
                             await self.put_kv_data("last_seen_by_zone", last_seen_map)
                         return report
-                    report["status"] = "skipped"
-                    report["reason_code"] = "ALREADY_DELIVERED" if saw_submission else "LATEST_NOT_FOUND"
+                    report.status = RunStatus.SKIPPED
+                    report.reason_code = (
+                        RunReason.ALREADY_DELIVERED if saw_submission else RunReason.LATEST_NOT_FOUND
+                    )
                     if last_seen_dirty:
                         await self.put_kv_data("last_seen_by_zone", last_seen_map)
                     return report
 
-                batch_reports = await self._send_run_batches(
+                raw_batch_reports = await self._send_run_batches(
                     batches,
                     send_semaphore=asyncio.Semaphore(self._get_configured_send_concurrency()),
                 )
-                report["batches"] = batch_reports
-                report["sent_ok"] = sum(int(batch.get("sent_ok", 0)) for batch in batch_reports)
-                report["sent_total"] = sum(int(batch.get("sent_total", 0)) for batch in batch_reports)
+                batch_reports = [self._coerce_run_batch_report(item) for item in raw_batch_reports]
+                report.batches = batch_reports
+                report.sent_ok = sum(batch.sent_ok for batch in batch_reports)
+                report.sent_total = sum(batch.sent_total for batch in batch_reports)
                 if batch_reports:
                     first_batch = batch_reports[0]
-                    report["zone"] = str(first_batch.get("zone", primary_zone))
-                    report["paper_id"] = str(first_batch.get("paper_id", ""))
-                    report["detail_url"] = str(first_batch.get("detail_url", ""))
+                    report.zone = first_batch.zone or primary_zone
+                    report.paper_id = first_batch.paper_id
+                    report.detail_url = first_batch.detail_url
                 first_debug_reason = self._pick_first_batch_debug_reason(batch_reports)
                 if first_debug_reason:
-                    report["debug_reason"] = first_debug_reason
+                    report.debug_reason = first_debug_reason
 
                 if last_seen_dirty:
                     await self.put_kv_data("last_seen_by_zone", last_seen_map)
 
-                report["status"], report["reason_code"] = self._resolve_run_batch_reports(
+                report.status, report.reason_code = self._resolve_run_batch_reports(
                     batch_reports=batch_reports,
-                    sent_ok=report["sent_ok"],
-                    sent_total=report["sent_total"],
+                    sent_ok=report.sent_ok,
+                    sent_total=report.sent_total,
                 )
                 return report
             finally:
@@ -764,7 +779,7 @@ class ShitJournalDailyPlugin(Star):
         last_seen_map: dict[str, str],
         force: bool,
         latest_only: bool,
-    ) -> tuple[list[dict[str, Any]], bool, bool, list[str]]:
+    ) -> tuple[list[RunBatch], bool, bool, list[str]]:
         if latest_only:
             return await self._select_latest_only_run_batches(
                 zone_order=zone_order,
@@ -776,7 +791,7 @@ class ShitJournalDailyPlugin(Star):
         saw_submission = False
         last_seen_dirty = False
         unresolved_targets = targets.copy()
-        batches: list[dict[str, Any]] = []
+        batches: list[RunBatch] = []
         warnings: list[str] = []
         for index, zone in enumerate(zone_order):
             if not unresolved_targets:
@@ -813,11 +828,11 @@ class ShitJournalDailyPlugin(Star):
         targets: list[str],
         last_seen_map: dict[str, str],
         force: bool,
-    ) -> tuple[list[dict[str, Any]], bool, bool, list[str]]:
+    ) -> tuple[list[RunBatch], bool, bool, list[str]]:
         saw_submission = False
         last_seen_dirty = False
         unresolved_targets = targets.copy()
-        batches: list[dict[str, Any]] = []
+        batches: list[RunBatch] = []
         warnings: list[str] = []
         for index, zone in enumerate(zone_order):
             if not unresolved_targets:
@@ -856,12 +871,12 @@ class ShitJournalDailyPlugin(Star):
         last_seen_map: dict[str, str],
         force: bool,
         first_page_candidates: list[dict[str, Any]] | None,
-    ) -> tuple[list[dict[str, Any]], set[str], bool, bool, list[str]]:
+    ) -> tuple[list[RunBatch], set[str], bool, bool, list[str]]:
         if not first_page_candidates:
             return [], set(), False, False, []
         sent_history_by_target = await self._get_run_sent_histories(zone, unresolved_targets)
         sent_history_lookup_by_target = self._build_history_lookup(sent_history_by_target)
-        batches: list[dict[str, Any]] = []
+        batches: list[RunBatch] = []
         matched_targets: set[str] = set()
         saw_submission = False
         last_seen_dirty = False
@@ -913,7 +928,7 @@ class ShitJournalDailyPlugin(Star):
         last_seen_map: dict[str, str],
         force: bool,
         first_page_candidates: list[dict[str, Any]] | None,
-    ) -> tuple[dict[str, Any] | None, set[str], bool, bool]:
+    ) -> tuple[RunBatch | None, set[str], bool, bool]:
         candidates = first_page_candidates
         if not candidates:
             return None, set(), False, False
@@ -980,8 +995,8 @@ class ShitJournalDailyPlugin(Star):
         is_primary: bool,
         zone_latest_recorded: bool,
         last_seen_map: dict[str, str],
-    ) -> tuple[list[dict[str, Any]], bool, bool, bool, set[str]]:
-        page_batches: list[dict[str, Any]] = []
+    ) -> tuple[list[RunBatch], bool, bool, bool, set[str]]:
+        page_batches: list[RunBatch] = []
         page_targets: set[str] = set()
         occupied_targets = set(matched_targets)
         last_seen_dirty = False
@@ -1071,16 +1086,16 @@ class ShitJournalDailyPlugin(Star):
         targets: list[str],
         sent_history_by_target: dict[str, list[str]],
         sent_history_lookup_by_target: dict[str, set[str]],
-    ) -> dict[str, Any]:
-        return {
-            "zone": zone,
-            "latest": candidate,
-            "paper_id": paper_id,
-            "detail_url": self._build_preprint_detail_url(paper_id),
-            "targets": targets,
-            "sent_history_by_target": sent_history_by_target,
-            "sent_history_lookup_by_target": sent_history_lookup_by_target,
-        }
+    ) -> RunBatch:
+        return RunBatch(
+            zone=zone,
+            latest=candidate,
+            paper_id=paper_id,
+            detail_url=self._build_preprint_detail_url(paper_id),
+            targets=targets,
+            sent_history_by_target=sent_history_by_target,
+            sent_history_lookup_by_target=sent_history_lookup_by_target,
+        )
 
     async def _fetch_run_candidates_page(
         self,
@@ -1179,15 +1194,15 @@ class ShitJournalDailyPlugin(Star):
 
     async def _send_run_batches(
         self,
-        batches: list[dict[str, Any]],
+        batches: list[RunBatch],
         *,
         send_semaphore: asyncio.Semaphore | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RunBatchReport | dict[str, Any]]:
         if not batches:
             return []
         semaphore = asyncio.Semaphore(self._resolve_batch_send_concurrency(len(batches)))
 
-        async def _send_one(batch: dict[str, Any]) -> dict[str, Any]:
+        async def _send_one(batch: RunBatch) -> RunBatchReport:
             async with semaphore:
                 if send_semaphore is None:
                     return await self._send_run_batch(batch)
@@ -1197,17 +1212,17 @@ class ShitJournalDailyPlugin(Star):
 
     async def _send_run_batch(
         self,
-        batch: dict[str, Any],
+        batch: RunBatch,
         *,
         send_semaphore: asyncio.Semaphore | None = None,
-    ) -> dict[str, Any]:
-        zone = str(batch["zone"])
-        latest = dict(batch["latest"])
-        paper_id = str(batch["paper_id"])
-        detail_url = str(batch["detail_url"])
-        targets = list(batch["targets"])
-        sent_history_by_target = dict(batch["sent_history_by_target"])
-        sent_history_lookup_by_target = dict(batch["sent_history_lookup_by_target"])
+    ) -> RunBatchReport:
+        zone = str(batch.zone)
+        latest = dict(batch.latest)
+        paper_id = str(batch.paper_id)
+        detail_url = str(batch.detail_url)
+        targets = list(batch.targets)
+        sent_history_by_target = dict(batch.sent_history_by_target)
+        sent_history_lookup_by_target = dict(batch.sent_history_lookup_by_target)
         report = self._build_run_batch_report(
             zone=zone,
             paper_id=paper_id,
@@ -1236,7 +1251,7 @@ class ShitJournalDailyPlugin(Star):
                 pdf_url=pdf_url,
                 send_semaphore=send_semaphore,
             )
-            report["sent_ok"] = sent_ok
+            report.sent_ok = sent_ok
             if sent_success_targets:
                 await self._mark_targets_delivered(
                     zone=zone,
@@ -1245,11 +1260,11 @@ class ShitJournalDailyPlugin(Star):
                     sent_history_by_target=sent_history_by_target,
                     sent_history_lookup_by_target=sent_history_lookup_by_target,
                 )
-            report["status"] = self._resolve_send_status(sent_ok=sent_ok, sent_total=len(targets))
-            report["reason_code"] = self._resolve_send_reason_code(str(report["status"]))
+            report.status = self._resolve_send_status(sent_ok=sent_ok, sent_total=len(targets))
+            report.reason_code = self._resolve_send_reason_code(report.status)
             return report
         except Exception as exc:
-            if report["sent_ok"] > 0:
+            if report.sent_ok > 0:
                 logger.error(
                     "写入推送去重状态失败：分区=%s 论文ID=%s 错误=%s",
                     zone,
@@ -1259,7 +1274,7 @@ class ShitJournalDailyPlugin(Star):
                 )
                 return self._build_failed_run_batch_report(
                     report=report,
-                    reason_code="DELIVERY_STATE_WRITE_FAILED",
+                    reason_code=RunReason.DELIVERY_STATE_WRITE_FAILED,
                     debug_reason=str(exc),
                 )
             logger.error(
@@ -1271,7 +1286,7 @@ class ShitJournalDailyPlugin(Star):
             )
             return self._build_failed_run_batch_report(
                 report=report,
-                reason_code="ALL_SENDS_FAILED",
+                reason_code=RunReason.ALL_SENDS_FAILED,
                 debug_reason=str(exc),
             )
         finally:
@@ -1288,55 +1303,84 @@ class ShitJournalDailyPlugin(Star):
         paper_id: str,
         detail_url: str,
         sent_total: int,
-    ) -> dict[str, Any]:
-        return {
-            "status": "failed",
-            "reason_code": "",
-            "zone": zone,
-            "paper_id": paper_id,
-            "detail_url": detail_url,
-            "sent_ok": 0,
-            "sent_total": sent_total,
-            "debug_reason": "",
-        }
+    ) -> RunBatchReport:
+        return RunBatchReport(
+            status=RunStatus.FAILED,
+            reason_code=RunReason.UNKNOWN,
+            zone=zone,
+            paper_id=paper_id,
+            detail_url=detail_url,
+            sent_ok=0,
+            sent_total=sent_total,
+            debug_reason="",
+        )
 
     def _build_failed_run_batch_report(
         self,
         *,
-        report: dict[str, Any],
-        reason_code: str,
+        report: RunBatchReport,
+        reason_code: RunReason | str,
         debug_reason: str,
-    ) -> dict[str, Any]:
-        report["status"] = "failed"
-        report["reason_code"] = reason_code
-        report["debug_reason"] = mask_sensitive_text(debug_reason)
+    ) -> RunBatchReport:
+        report.status = RunStatus.FAILED
+        report.reason_code = self._coerce_run_reason(reason_code)
+        report.debug_reason = mask_sensitive_text(debug_reason)
         return report
 
-    def _resolve_send_status(self, *, sent_ok: int, sent_total: int) -> str:
+    def _resolve_send_status(self, *, sent_ok: int, sent_total: int) -> RunStatus:
         if sent_total > 0 and sent_ok == sent_total:
-            return "success"
+            return RunStatus.SUCCESS
         if sent_ok > 0:
-            return "partial"
-        return "failed"
+            return RunStatus.PARTIAL
+        return RunStatus.FAILED
 
     def _resolve_run_batch_reports(
         self,
         *,
-        batch_reports: list[dict[str, Any]],
+        batch_reports: list[RunBatchReport],
         sent_ok: int,
         sent_total: int,
-    ) -> tuple[str, str]:
-        if any(str(batch.get("reason_code", "")) == "DELIVERY_STATE_WRITE_FAILED" for batch in batch_reports):
-            return "failed", "DELIVERY_STATE_WRITE_FAILED"
+    ) -> tuple[RunStatus, RunReason]:
+        if any(batch.reason_code == RunReason.DELIVERY_STATE_WRITE_FAILED for batch in batch_reports):
+            return RunStatus.FAILED, RunReason.DELIVERY_STATE_WRITE_FAILED
         status = self._resolve_send_status(sent_ok=sent_ok, sent_total=sent_total)
         return status, self._resolve_send_reason_code(status)
 
-    def _resolve_send_reason_code(self, status: str) -> str:
-        if status == "success":
-            return "PUSHED_SUCCESSFULLY"
-        if status == "partial":
-            return "PUSHED_PARTIALLY"
-        return "ALL_SENDS_FAILED"
+    def _resolve_send_reason_code(self, status: RunStatus | str) -> RunReason:
+        normalized = self._coerce_run_status(status)
+        if normalized == RunStatus.SUCCESS:
+            return RunReason.PUSHED_SUCCESSFULLY
+        if normalized == RunStatus.PARTIAL:
+            return RunReason.PUSHED_PARTIALLY
+        return RunReason.ALL_SENDS_FAILED
+
+    def _coerce_run_status(self, value: RunStatus | str) -> RunStatus:
+        if isinstance(value, RunStatus):
+            return value
+        text = str(value).strip().lower()
+        try:
+            return RunStatus(text)
+        except ValueError:
+            return RunStatus.UNKNOWN
+
+    def _coerce_run_reason(self, value: RunReason | str) -> RunReason:
+        if isinstance(value, RunReason):
+            return value
+        text = str(value).strip()
+        try:
+            return RunReason(text)
+        except ValueError:
+            return RunReason.UNKNOWN
+
+    def _coerce_run_batch_report(self, value: RunBatchReport | dict[str, Any]) -> RunBatchReport:
+        if isinstance(value, RunBatchReport):
+            return value
+        return RunBatchReport.from_dict(value)
+
+    def _to_run_report_dict(self, report: RunReport | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(report, RunReport):
+            return report.to_dict()
+        return dict(report)
 
     def _resolve_batch_send_concurrency(self, batch_count: int) -> int:
         return min(MAX_BATCH_SEND_CONCURRENCY, self._get_configured_send_concurrency(), batch_count)
@@ -1355,9 +1399,9 @@ class ShitJournalDailyPlugin(Star):
     def _render_reason_text(self, reason_code: str) -> str:
         return REPORT_REASON_LABELS.get(reason_code, reason_code)
 
-    def _pick_first_batch_debug_reason(self, batch_reports: list[dict[str, Any]]) -> str:
+    def _pick_first_batch_debug_reason(self, batch_reports: list[RunBatchReport]) -> str:
         for batch_report in batch_reports:
-            debug_reason = mask_sensitive_text(str(batch_report.get("debug_reason", "")).strip())
+            debug_reason = mask_sensitive_text(str(batch_report.debug_reason).strip())
             if debug_reason:
                 return debug_reason
         return ""
@@ -2333,19 +2377,20 @@ class ShitJournalDailyPlugin(Star):
             include_debug=include_debug,
         )
 
-    def _render_report(self, report: dict[str, Any], include_debug: bool = False) -> str:
-        status = str(report.get("status", "unknown") or "unknown")
-        reason_code = str(report.get("reason_code") or report.get("reason") or "UNKNOWN")
-        debug_reason = mask_sensitive_text(str(report.get("debug_reason", "")).strip())
-        latest_only = self._to_bool(report.get("latest_only"), False)
-        requested_zone = str(report.get("requested_zone", "")).strip()
-        warnings = self._clean_warning_list(report.get("warnings", []))
+    def _render_report(self, report: RunReport | dict[str, Any], include_debug: bool = False) -> str:
+        report_dict = self._to_run_report_dict(report)
+        status = str(report_dict.get("status", "unknown") or "unknown")
+        reason_code = str(report_dict.get("reason_code") or report_dict.get("reason") or "UNKNOWN")
+        debug_reason = mask_sensitive_text(str(report_dict.get("debug_reason", "")).strip())
+        latest_only = self._to_bool(report_dict.get("latest_only"), False)
+        requested_zone = str(report_dict.get("requested_zone", "")).strip()
+        warnings = self._clean_warning_list(report_dict.get("warnings", []))
         status_text = self._render_status_text(status)
         reason_text = self._render_reason_text(reason_code)
-        batches = list(report.get("batches", []))
+        batches = list(report_dict.get("batches", []))
         if len(batches) > 1:
             return self._render_multi_batch_report(
-                report=report,
+                report=report_dict,
                 status_text=status_text,
                 reason_text=reason_text,
                 latest_only=latest_only,
@@ -2356,7 +2401,7 @@ class ShitJournalDailyPlugin(Star):
             )
         if len(batches) == 1:
             return self._render_single_batch_report(
-                report=report,
+                report=report_dict,
                 batch=batches[0],
                 status_text=status_text,
                 reason_text=reason_text,
@@ -2367,15 +2412,15 @@ class ShitJournalDailyPlugin(Star):
                 include_debug=include_debug,
             )
         empty_batch = {
-            "status": str(report.get("status", "unknown") or "unknown"),
-            "zone": str(report.get("zone", "")).strip(),
-            "paper_id": str(report.get("paper_id", "")).strip(),
-            "detail_url": str(report.get("detail_url", "")).strip(),
-            "sent_ok": report.get("sent_ok", 0),
-            "sent_total": report.get("sent_total", 0),
+            "status": str(report_dict.get("status", "unknown") or "unknown"),
+            "zone": str(report_dict.get("zone", "")).strip(),
+            "paper_id": str(report_dict.get("paper_id", "")).strip(),
+            "detail_url": str(report_dict.get("detail_url", "")).strip(),
+            "sent_ok": report_dict.get("sent_ok", 0),
+            "sent_total": report_dict.get("sent_total", 0),
         }
         return self._render_single_batch_report(
-            report=report,
+            report=report_dict,
             batch=empty_batch,
             status_text=status_text,
             reason_text=reason_text,
