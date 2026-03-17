@@ -9,6 +9,8 @@ from astrbot.api.message_components import File, Image, Node, Nodes, Plain
 from astrbot.core.platform.message_session import MessageSesion
 from astrbot.core.platform.message_type import MessageType
 
+from .session_message import is_group_message_session, is_private_message_session
+
 
 FORWARD_SENDER_NAME = "S.H.I.T Journal"
 ONEBOT_ADAPTER_NAME = "aiocqhttp"
@@ -249,15 +251,11 @@ class PushMessageService:
         return bool(event.get_group_id())
 
     def _should_embed_pdf_in_session_forward(self, session: str) -> bool:
-        try:
-            message_session = MessageSesion.from_str(session)
-        except Exception:
-            return False
-        return message_session.message_type == MessageType.GROUP_MESSAGE
+        return is_group_message_session(session)
 
     def _is_onebot_private_event(self, event: AstrMessageEvent) -> bool:
         session = str(getattr(event, "unified_msg_origin", "")).strip()
-        return f":{MessageType.FRIEND_MESSAGE.value}:" in session
+        return is_private_message_session(session)
 
     def _resolve_merge_forward_platform(self, context: Any, session: str) -> Any | None:
         if not self._cfg_bool("send_merge_forward", False):
@@ -384,13 +382,14 @@ class PushMessageService:
             )
         if not send_pdf_tail:
             return True
-        return await self._send_merge_pdf_tail_for_session(
+        await self._send_merge_pdf_tail_for_session(
             context=context,
             session=session,
             adapter_name=adapter_name,
             pdf_file=pdf_file,
             pdf_url=pdf_url,
         )
+        return True
 
     async def _send_merge_pdf_tail_for_event(
         self,
@@ -399,15 +398,20 @@ class PushMessageService:
         adapter_name: str,
         pdf_file: Path,
         pdf_url: str,
-    ) -> None:
+    ) -> bool:
         file_chain = self._build_pdf_only_chain(
             adapter_name=adapter_name,
             pdf_file=pdf_file,
             pdf_url=pdf_url,
         )
         if file_chain is None:
-            return
-        await event.send(file_chain)
+            return True
+        try:
+            await event.send(file_chain)
+            return True
+        except Exception:
+            logger.warning("合并转发尾部 PDF 发送异常，但主体消息已发送成功。", exc_info=True)
+            return False
 
     async def _send_merge_pdf_tail_for_session(
         self,
@@ -425,7 +429,15 @@ class PushMessageService:
         )
         if file_chain is None:
             return True
-        return await context.send_message(session, file_chain)
+        try:
+            tail_ok = await context.send_message(session, file_chain)
+        except Exception:
+            logger.warning("合并转发尾部 PDF 发送异常，但主体消息已发送成功：会话=%s", session, exc_info=True)
+            return False
+        if not tail_ok:
+            logger.warning("合并转发尾部 PDF 发送失败，但主体消息已发送成功：会话=%s", session)
+            return False
+        return True
 
     async def _send_standard_event_push(
         self,

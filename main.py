@@ -13,16 +13,17 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
-from astrbot.core.platform.message_type import MessageType
 
 try:
     from .services import PdfService, PushMessageService, SupabaseClient, TempFileManager
+    from .services.session_message import is_private_message_session
     from .services.sensitive import mask_sensitive_text
 except ImportError:
     _plugin_dir = Path(__file__).resolve().parent
     if str(_plugin_dir) not in sys.path:
         sys.path.insert(0, str(_plugin_dir))
     from services import PdfService, PushMessageService, SupabaseClient, TempFileManager
+    from services.session_message import is_private_message_session
     from services.sensitive import mask_sensitive_text
 
 
@@ -444,7 +445,7 @@ class ShitJournalDailyPlugin(Star):
         if event.get_group_id():
             return "本群"
         session_key = str(getattr(event, "unified_msg_origin", "")).strip()
-        if f":{MessageType.FRIEND_MESSAGE.value}:" in session_key:
+        if is_private_message_session(session_key):
             return "当前私聊"
         return "当前会话"
 
