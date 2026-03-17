@@ -24,7 +24,6 @@ if __package__:
         ReportRenderer,
         RunBatchSender,
         RunCycleService,
-        RunReport,
         RunSelector,
         SupabaseClient,
         TempFileManager,
@@ -46,7 +45,6 @@ else:
         ReportRenderer,
         RunBatchSender,
         RunCycleService,
-        RunReport,
         RunSelector,
         SupabaseClient,
         TempFileManager,
@@ -210,9 +208,12 @@ class ShitJournalDailyPlugin(Star):
             context_getter=lambda: self.context,
             cfg_int_getter=self._cfg_int,
             history_store=self._history_store,
-            load_submission_payload=self._load_submission_payload,
-            prepare_pdf_assets=self._prepare_pdf_assets,
-            build_push_text=lambda payload, detail_url, zone: self._build_push_text(
+            load_submission_payload=lambda latest, paper_id: self._asset_pipeline.load_submission_payload(
+                latest,
+                paper_id,
+            ),
+            prepare_pdf_assets=lambda payload, paper_id: self._asset_pipeline.prepare_pdf_assets(payload, paper_id),
+            build_push_text=lambda payload, detail_url, zone: self._asset_pipeline.build_push_text(
                 payload,
                 detail_url,
                 zone=zone,
@@ -220,7 +221,7 @@ class ShitJournalDailyPlugin(Star):
             build_meta_preview=lambda payload: self._asset_pipeline.build_meta_preview(payload),
             send_session_push=lambda **kwargs: self._push_messages.send_session_push(**kwargs),
             release_temp_files=lambda pdf_file, png_file: self._temp_files.release(pdf_file, png_file),
-            maybe_trim_temp_files=self._maybe_trim_temp_files,
+            maybe_trim_temp_files=lambda: self._maybe_trim_temp_files(),
             logger=logger,
             mask_sensitive_text=mask_sensitive_text,
             max_send_concurrency=MAX_SEND_CONCURRENCY,
@@ -232,7 +233,7 @@ class ShitJournalDailyPlugin(Star):
             cfg_getter=self._cfg,
             run_selector=self._run_selector,
             history_store=self._history_store,
-            send_batches=lambda batches, send_semaphore=None: self._send_run_batches(
+            send_batches=lambda batches, send_semaphore=None: self._run_batch_sender.send_run_batches(
                 batches,
                 send_semaphore=send_semaphore,
             ),
@@ -245,7 +246,7 @@ class ShitJournalDailyPlugin(Star):
             get_primary_zone=self._get_primary_zone,
             get_candidate_zones=self._get_candidate_zones,
             get_configured_send_concurrency=self._get_configured_send_concurrency,
-            maybe_trim_temp_files=self._maybe_trim_temp_files,
+            maybe_trim_temp_files=lambda: self._maybe_trim_temp_files(),
             logger=logger,
             mask_sensitive_text=mask_sensitive_text,
             run_fetch_page_size=RUN_FETCH_PAGE_SIZE,
@@ -261,10 +262,7 @@ class ShitJournalDailyPlugin(Star):
             kv_putter=self.put_kv_data,
             get_cron_job_ids=lambda: list(self._cron_job_ids),
             set_cron_job_ids=self._set_cron_job_ids,
-            scheduled_handler=lambda schedule_time="": self._cron_scheduler.scheduled_tick(
-                schedule_time=schedule_time,
-            ),
-            run_cycle=lambda **kwargs: self._run_cycle(**kwargs),
+            run_cycle=lambda **kwargs: self._run_cycle_service.run_cycle(**kwargs),
             render_report=lambda report, include_debug=False: self._report_renderer.render_report(
                 report,
                 include_debug=include_debug,
@@ -278,16 +276,23 @@ class ShitJournalDailyPlugin(Star):
             select_candidate_from_zones=lambda **kwargs: self._run_selector.select_chi_shi_candidate_from_zones(
                 **kwargs,
             ),
-            load_submission_payload=self._load_submission_payload,
-            prepare_pdf_assets=self._prepare_pdf_assets,
-            build_push_text=lambda payload, detail_url, zone: self._build_push_text(
+            load_submission_payload=lambda candidate, paper_id: self._asset_pipeline.load_submission_payload(
+                candidate,
+                paper_id,
+            ),
+            prepare_pdf_assets=lambda payload, paper_id: self._asset_pipeline.prepare_pdf_assets(payload, paper_id),
+            build_push_text=lambda payload, detail_url, zone: self._asset_pipeline.build_push_text(
                 payload,
                 detail_url,
                 zone=zone,
             ),
-            build_preprint_detail_url=self._build_preprint_detail_url,
+            build_preprint_detail_url=lambda paper_id: self._asset_pipeline.build_preprint_detail_url(paper_id),
             send_event_push=lambda **kwargs: self._push_messages.send_event_push(**kwargs),
-            mark_chi_shi_paper_sent=self._mark_chi_shi_paper_sent,
+            mark_chi_shi_paper_sent=lambda zone, session_key, paper_id: self._history_store.mark_chi_shi_paper_sent(
+                zone,
+                session_key,
+                paper_id,
+            ),
             get_primary_zone=self._get_primary_zone,
             get_candidate_zones=self._get_candidate_zones,
             build_zone_scope_text=self._build_zone_scope_text,
@@ -390,7 +395,7 @@ class ShitJournalDailyPlugin(Star):
 
         if action == "run":
             force = bool(arg) and arg.split()[0] == "force"
-            report = await self._run_cycle(force=force, source=f"手动:{event.get_sender_id()}")
+            report = await self._run_cycle_service.run_cycle(force=force, source=f"手动:{event.get_sender_id()}")
             yield event.plain_result(self._report_renderer.render_report(report))
             return
 
@@ -465,19 +470,6 @@ class ShitJournalDailyPlugin(Star):
         for output in outputs:
             yield event.plain_result(output)
 
-    def __getattr__(self, name: str) -> Any:
-        compatibility_map = {
-            "_register_cron_jobs": lambda: self._cron_scheduler.register_cron_jobs,
-            "_clear_cron_jobs": lambda: self._cron_scheduler.clear_cron_jobs,
-            "_parse_command_action_arg": lambda: self._command_gate.parse_command_action_arg,
-            "_build_chi_shi_failure_text": lambda: self._chi_shi_service.build_chi_shi_failure_text,
-            "_send_run_batches": lambda: self._run_batch_sender.send_run_batches,
-        }
-        getter = compatibility_map.get(name)
-        if getter is None:
-            raise AttributeError(name)
-        return getter()
-
     def _get_chi_shi_session_scope_text(self, event: AstrMessageEvent) -> str:
         if event.get_group_id():
             return "本群"
@@ -489,19 +481,6 @@ class ShitJournalDailyPlugin(Star):
     def _set_cron_job_ids(self, ids: list[str]) -> None:
         self._cron_job_ids = [str(job_id).strip() for job_id in ids if str(job_id).strip()]
 
-    async def _run_cycle(
-        self,
-        *,
-        force: bool,
-        source: str,
-        latest_only: bool = False,
-    ) -> RunReport:
-        return await self._run_cycle_service.run_cycle(
-            force=force,
-            source=source,
-            latest_only=latest_only,
-        )
-
     def _get_configured_send_concurrency(self) -> int:
         raw_concurrency = getattr(self, "_send_concurrency", 3)
         try:
@@ -509,30 +488,6 @@ class ShitJournalDailyPlugin(Star):
         except (TypeError, ValueError):
             configured_concurrency = 3
         return min(MAX_SEND_CONCURRENCY, max(1, configured_concurrency))
-
-    async def _load_submission_payload(
-        self,
-        latest: dict[str, Any],
-        paper_id: str,
-    ) -> dict[str, Any]:
-        return await self._asset_pipeline.load_submission_payload(latest, paper_id)
-
-    async def _prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path, str]:
-        return await self._asset_pipeline.prepare_pdf_assets(payload, paper_id)
-
-    async def _mark_chi_shi_paper_sent(self, zone: str, session_key: str, paper_id: str) -> None:
-        await self._history_store.mark_chi_shi_paper_sent(zone, session_key, paper_id)
-
-    def _build_push_text(
-        self,
-        payload: dict[str, Any],
-        detail_url: str,
-        zone: str = "",
-    ) -> str:
-        return self._asset_pipeline.build_push_text(payload, detail_url, zone=zone)
-
-    def _build_preprint_detail_url(self, paper_id: str) -> str:
-        return self._asset_pipeline.build_preprint_detail_url(paper_id)
 
     def _resolve_plugin_data_dir(self) -> Path:
         plugin_name = str(

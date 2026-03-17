@@ -16,7 +16,6 @@ class CronScheduler:
         kv_putter: Callable[[str, Any], Awaitable[None]],
         get_cron_job_ids: Callable[[], list[str]],
         set_cron_job_ids: Callable[[list[str]], None],
-        scheduled_handler: Callable[..., Awaitable[None]],
         run_cycle: Callable[..., Awaitable[Any]],
         render_report: Callable[..., str],
         logger: Any,
@@ -30,7 +29,6 @@ class CronScheduler:
         self._kv_putter = kv_putter
         self._get_cron_job_ids = get_cron_job_ids
         self._set_cron_job_ids = set_cron_job_ids
-        self._scheduled_handler = scheduled_handler
         self._run_cycle = run_cycle
         self._render_report = render_report
         self._logger = logger
@@ -86,7 +84,7 @@ class CronScheduler:
         job = await cron_manager.add_basic_job(
             name=f"{plugin_id}_shitjournal_{index}",
             cron_expression=cron_expression,
-            handler=self._scheduled_handler,
+            handler=self.scheduled_tick,
             description=f"shitjournal 定时推送 {time_text}",
             timezone=timezone,
             payload={"schedule_time": time_text},
