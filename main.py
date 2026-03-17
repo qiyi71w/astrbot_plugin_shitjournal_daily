@@ -122,7 +122,6 @@ class ShitJournalDailyPlugin(Star):
         self._next_temp_trim_monotonic = 0.0
         self._plugin_data_dir = Path(".")
         self._temp_dir = Path(".")
-        self._send_concurrency = 3
         self._supabase = SupabaseClient(
             cfg_getter=self._cfg,
             cfg_int_getter=self._cfg_int,
@@ -245,7 +244,7 @@ class ShitJournalDailyPlugin(Star):
             ),
             get_primary_zone=self._get_primary_zone,
             get_candidate_zones=self._get_candidate_zones,
-            get_configured_send_concurrency=self._get_configured_send_concurrency,
+            get_configured_send_concurrency=self._run_batch_sender.get_configured_send_concurrency,
             maybe_trim_temp_files=lambda: self._maybe_trim_temp_files(),
             logger=logger,
             mask_sensitive_text=mask_sensitive_text,
@@ -253,6 +252,9 @@ class ShitJournalDailyPlugin(Star):
         )
 
     def _create_cron_scheduler(self) -> CronScheduler:
+        def _update_cron_job_ids(ids: list[str]) -> None:
+            self._cron_job_ids = [str(job_id).strip() for job_id in ids if str(job_id).strip()]
+
         return CronScheduler(
             context_getter=lambda: self.context,
             plugin_id_getter=lambda: getattr(self, "plugin_id", "shitjournal_daily"),
@@ -261,7 +263,7 @@ class ShitJournalDailyPlugin(Star):
             kv_getter=self.get_kv_data,
             kv_putter=self.put_kv_data,
             get_cron_job_ids=lambda: list(self._cron_job_ids),
-            set_cron_job_ids=self._set_cron_job_ids,
+            set_cron_job_ids=_update_cron_job_ids,
             run_cycle=lambda **kwargs: self._run_cycle_service.run_cycle(**kwargs),
             render_report=lambda report, include_debug=False: self._report_renderer.render_report(
                 report,
@@ -306,12 +308,6 @@ class ShitJournalDailyPlugin(Star):
         self._temp_dir = self._plugin_data_dir / "tmp"
         self._temp_files.set_temp_dir(self._temp_dir)
         self._ensure_supabase_key_or_raise()
-        self._send_concurrency = self._cfg_int(
-            "send_concurrency",
-            3,
-            min_value=1,
-            max_value=MAX_SEND_CONCURRENCY,
-        )
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         await self._history_store.ensure_chi_shi_history_storage_ready()
         await self._cron_scheduler.clear_cron_jobs()
@@ -477,17 +473,6 @@ class ShitJournalDailyPlugin(Star):
         if is_private_message_session(session_key):
             return "当前私聊"
         return "当前会话"
-
-    def _set_cron_job_ids(self, ids: list[str]) -> None:
-        self._cron_job_ids = [str(job_id).strip() for job_id in ids if str(job_id).strip()]
-
-    def _get_configured_send_concurrency(self) -> int:
-        raw_concurrency = getattr(self, "_send_concurrency", 3)
-        try:
-            configured_concurrency = int(raw_concurrency)
-        except (TypeError, ValueError):
-            configured_concurrency = 3
-        return min(MAX_SEND_CONCURRENCY, max(1, configured_concurrency))
 
     def _resolve_plugin_data_dir(self) -> Path:
         plugin_name = str(
