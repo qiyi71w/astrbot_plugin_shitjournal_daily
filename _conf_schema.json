@@ -14,7 +14,7 @@
     "description": "候补分区列表",
     "type": "list",
     "default": ["septic"],
-    "hint": "仅在开启分区回退后生效；按填写顺序依次尝试，自动跳过重复项和目标分区自身"
+    "hint": "仅在开启分区回退后生效；可选分区为 latrine、septic、stone、sediment；按填写顺序依次尝试，自动跳过重复项和目标分区自身"
   },
   "schedule_times": {
     "description": "每日定时触发时间",
