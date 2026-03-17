@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .models import RunReport
+from .warning_text import append_warning_lines, clean_warning_list
 
 DETAIL_URL_BASE = "https://shitjournal.org"
 
@@ -30,7 +31,7 @@ class ReportRenderer:
         debug_reason = self._mask_sensitive_text(str(report_dict.get("debug_reason", "")).strip())
         latest_only = self._to_bool(report_dict.get("latest_only"), False)
         requested_zone = str(report_dict.get("requested_zone", "")).strip()
-        warnings = self._clean_warning_list(report_dict.get("warnings", []))
+        warnings = clean_warning_list(report_dict.get("warnings", []), self._mask_sensitive_text)
         status_text = self._render_status_text(status)
         reason_text = self._render_reason_text(reason_code)
         batches = list(report_dict.get("batches", []))
@@ -107,23 +108,6 @@ class ReportRenderer:
     def _render_reason_text(self, reason_code: str) -> str:
         return self._reason_labels.get(reason_code, reason_code)
 
-    def _clean_warning_list(self, raw: Any) -> list[str]:
-        if not isinstance(raw, list):
-            return []
-        warnings: list[str] = []
-        seen: set[str] = set()
-        for item in raw:
-            text = self._mask_sensitive_text(str(item).strip())
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            warnings.append(text)
-        return warnings
-
-    def _append_warning_lines(self, lines: list[str], warnings: list[str]) -> None:
-        for index, warning in enumerate(self._clean_warning_list(warnings), start=1):
-            lines.append(f"告警{index}: {warning}")
-
     def _render_run_mode_text(self, latest_only: bool) -> str:
         if latest_only:
             return "模式: 仅检查最新一篇"
@@ -167,7 +151,7 @@ class ReportRenderer:
             lines.append(mode_text)
         if requested_zone and requested_zone != report_zone:
             lines.append(f"请求分区: {requested_zone}")
-        self._append_warning_lines(lines, warnings)
+        append_warning_lines(lines, warnings, self._mask_sensitive_text)
         if include_debug and debug_reason:
             lines.append(f"调试信息: {debug_reason}")
         return "\n".join(lines)
