@@ -19,6 +19,7 @@ class ChiShiService:
         build_preprint_detail_url: Callable[[str], str],
         send_event_push: Callable[..., Awaitable[None]],
         mark_chi_shi_paper_sent: Callable[[str, str, str], Awaitable[None]],
+        release_temp_files: Callable[[Path | None, Path | None], Awaitable[None]],
         get_primary_zone: Callable[[], str],
         get_candidate_zones: Callable[[str], list[str]],
         build_zone_scope_text: Callable[[list[str]], str],
@@ -33,6 +34,7 @@ class ChiShiService:
         self._build_preprint_detail_url = build_preprint_detail_url
         self._send_event_push = send_event_push
         self._mark_chi_shi_paper_sent = mark_chi_shi_paper_sent
+        self._release_temp_files = release_temp_files
         self._get_primary_zone = get_primary_zone
         self._get_candidate_zones = get_candidate_zones
         self._build_zone_scope_text = build_zone_scope_text
@@ -115,19 +117,30 @@ class ChiShiService:
         if not paper_id:
             return False, None, None
 
-        payload = await self._load_submission_payload(candidate, paper_id)
-        detail_url = self._build_preprint_detail_url(paper_id)
-        pdf_file, png_file, pdf_url = await self._prepare_pdf_assets(payload, paper_id)
-        text = self._build_push_text(payload, detail_url, zone)
-        await self._send_event_push(
-            event=event,
-            text=text,
-            png_file=png_file,
-            pdf_file=pdf_file,
-            pdf_url=pdf_url,
-        )
-        await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
-        return True, pdf_file, png_file
+        pdf_file: Path | None = None
+        png_file: Path | None = None
+        try:
+            payload = await self._load_submission_payload(candidate, paper_id)
+            detail_url = self._build_preprint_detail_url(paper_id)
+            pdf_file, png_file, pdf_url = await self._prepare_pdf_assets(payload, paper_id)
+            text = self._build_push_text(payload, detail_url, zone)
+            await self._send_event_push(
+                event=event,
+                text=text,
+                png_file=png_file,
+                pdf_file=pdf_file,
+                pdf_url=pdf_url,
+            )
+            await self._mark_chi_shi_paper_sent(zone, session_key, paper_id)
+            return True, pdf_file, png_file
+        except Exception as exc:
+            if pdf_file is None and png_file is None:
+                raise
+            try:
+                await self._release_temp_files(pdf_file, png_file)
+            except Exception as release_exc:
+                raise release_exc from exc
+            raise
 
     async def try_enter_chi_shi_cooldown(
         self,

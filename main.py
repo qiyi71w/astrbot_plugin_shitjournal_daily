@@ -295,6 +295,7 @@ class ShitJournalDailyPlugin(Star):
                 session_key,
                 paper_id,
             ),
+            release_temp_files=lambda pdf_file, png_file: self._temp_files.release(pdf_file, png_file),
             get_primary_zone=self._get_primary_zone,
             get_candidate_zones=self._get_candidate_zones,
             build_zone_scope_text=self._build_zone_scope_text,
