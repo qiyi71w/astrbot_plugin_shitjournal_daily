@@ -5,15 +5,28 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
-import aiofiles
 import httpx
 from astrbot.api import logger
 
+from .http_executor import HttpExecutor, HttpRequestOptions
 from .sensitive import mask_sensitive_text
 
-
-class _NonRetryableRequestError(RuntimeError):
-    pass
+MAX_FETCH_LIMIT = 20
+MIN_FETCH_LIMIT = 1
+MIN_FETCH_OFFSET = 0
+SIGNED_URL_EXPIRES_SECONDS = 3600
+DEFAULT_PDF_MAX_SIZE_MB = 50
+MIN_PDF_MAX_SIZE_MB = 1
+MAX_PDF_MAX_SIZE_MB = 512
+BYTES_PER_MB = 1024 * 1024
+HTTP_TIMEOUT_DEFAULT_SEC = 20
+HTTP_TIMEOUT_MIN_SEC = 5
+HTTP_RETRY_DEFAULT = 3
+HTTP_RETRY_MIN = 1
+MAX_CONNECTIONS = 16
+MAX_KEEPALIVE_CONNECTIONS = 16
+BACKOFF_BASE_SECONDS = 2
+BACKOFF_MAX_SECONDS = 8
 
 
 class SupabaseClient:
@@ -32,6 +45,12 @@ class SupabaseClient:
         self._default_bucket = default_bucket
         self._client: httpx.AsyncClient | None = None
         self._client_lock = asyncio.Lock()
+        self._http_executor = HttpExecutor(
+            get_client=lambda: self._get_http_client(),
+            backoff_sleep=lambda attempt: self._backoff_sleep(attempt),
+            mask_text=mask_sensitive_text,
+            mask_url=lambda url: self._mask_url(url),
+        )
 
     async def close(self) -> None:
         async with self._client_lock:
@@ -50,8 +69,8 @@ class SupabaseClient:
         limit: int,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit), 20))
-        safe_offset = max(0, int(offset))
+        safe_limit = max(MIN_FETCH_LIMIT, min(int(limit), MAX_FETCH_LIMIT))
+        safe_offset = max(MIN_FETCH_OFFSET, int(offset))
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
         select_fields = (
             "id,manuscript_title,author_name,institution,viscosity,discipline,"
@@ -64,20 +83,13 @@ class SupabaseClient:
             "limit": str(safe_limit),
             "offset": str(safe_offset),
         }
-        if zone == "septic":
-            params["order"] = "promoted_to_septic_at.desc.nullslast"
-        else:
-            params["order"] = "created_at.desc"
+        params["order"] = "promoted_to_septic_at.desc.nullslast" if zone == "septic" else "created_at.desc"
 
         url = f"{supabase_url}/rest/v1/preprints_with_ratings_mat"
         data = await self._request_json("GET", url, params=params)
         if not isinstance(data, list) or not data:
             return []
-        result: list[dict[str, Any]] = []
-        for item in data:
-            if isinstance(item, dict):
-                result.append(item)
-        return result
+        return [item for item in data if isinstance(item, dict)]
 
     async def fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
         supabase_url = str(self._cfg("supabase_url", self._default_url)).strip()
@@ -97,7 +109,11 @@ class SupabaseClient:
         bucket = str(self._cfg("supabase_bucket", self._default_bucket)).strip()
         escaped = quote(pdf_path, safe="/")
         url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{escaped}"
-        data = await self._request_json("POST", url, json_body={"expiresIn": 3600})
+        data = await self._request_json(
+            "POST",
+            url,
+            json_body={"expiresIn": SIGNED_URL_EXPIRES_SECONDS},
+        )
         signed = str((data or {}).get("signedURL", "")).strip()
         if not signed:
             logger.error("响应中缺少 signedURL 字段：地址=%s", self._mask_url(url))
@@ -105,133 +121,24 @@ class SupabaseClient:
         return self._resolve_signed_url(supabase_url, signed)
 
     async def download_pdf_file(self, signed_url: str, target_path: Path) -> tuple[int, str]:
-        signed_url = self._validate_signed_url(signed_url)
-        safe_url = self._mask_url(signed_url)
+        valid_signed_url = self._validate_signed_url(signed_url)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        max_pdf_mb = self._cfg_int("pdf_max_size_mb", 50, min_value=1, max_value=512)
-        max_pdf_bytes = max_pdf_mb * 1024 * 1024
+        max_pdf_mb = self._cfg_int(
+            "pdf_max_size_mb",
+            DEFAULT_PDF_MAX_SIZE_MB,
+            min_value=MIN_PDF_MAX_SIZE_MB,
+            max_value=MAX_PDF_MAX_SIZE_MB,
+        )
+        max_pdf_bytes = max_pdf_mb * BYTES_PER_MB
         timeout, retry, _ = self._http_request_options()
-        client = await self._get_http_client()
-        last_error: Exception | None = None
-        status_code = 0
-        content_type = ""
-
-        for attempt in range(1, retry + 1):
-            should_retry_after_release = False
-            try:
-                async with client.stream(
-                    method="GET",
-                    url=signed_url,
-                    headers=self._build_download_headers(),
-                    follow_redirects=False,
-                    timeout=timeout,
-                ) as response:
-                    status_code = response.status_code
-                    content_type = str(response.headers.get("content-type", ""))
-                    if 300 <= status_code < 400:
-                        location = self._mask_url(str(response.headers.get("location", "")).strip())
-                        logger.warning(
-                            "PDF 下载出现重定向，已阻止：状态码=%s 地址=%s 跳转=%s",
-                            status_code,
-                            safe_url,
-                            location or "<缺失>",
-                        )
-                        raise _NonRetryableRequestError("下载 PDF 时发生未预期的重定向")
-                    if status_code >= 500 and attempt < retry:
-                        logger.warning(
-                            "PDF 下载因状态码触发重试：状态码=%s 尝试=%s/%s 地址=%s",
-                            status_code,
-                            attempt,
-                            retry,
-                            safe_url,
-                        )
-                        should_retry_after_release = True
-                    elif status_code >= 400:
-                        body_preview = await self._read_response_preview(response)
-                        logger.warning(
-                            "PDF 下载 HTTP 错误：状态码=%s 地址=%s 响应=%s",
-                            status_code,
-                            safe_url,
-                            body_preview,
-                        )
-                        raise _NonRetryableRequestError(
-                            f"下载 PDF 时出现 HTTP 错误：{status_code}",
-                        )
-                    if "application/pdf" not in content_type.lower():
-                        logger.warning(
-                            "PDF 响应的内容类型不是 application/pdf：%s（将继续校验文件头）",
-                            content_type,
-                        )
-
-                    if not should_retry_after_release:
-                        header_preview = bytearray()
-                        downloaded_bytes = 0
-                        async with aiofiles.open(target_path, "wb") as fp:
-                            async for chunk in response.aiter_bytes(chunk_size=1024 * 64):
-                                if not chunk:
-                                    continue
-                                downloaded_bytes += len(chunk)
-                                if downloaded_bytes > max_pdf_bytes:
-                                    raise _NonRetryableRequestError(
-                                        f"PDF 文件过大：{downloaded_bytes} 字节，超过配置上限 {max_pdf_bytes} 字节",
-                                    )
-                                if len(header_preview) < 5:
-                                    missing = 5 - len(header_preview)
-                                    header_preview.extend(chunk[:missing])
-                                    if len(header_preview) >= 5 and bytes(header_preview[:5]) != b"%PDF-":
-                                        raise _NonRetryableRequestError(
-                                            "下载的文件不是有效的 PDF",
-                                        )
-                                await fp.write(chunk)
-                        if bytes(header_preview[:5]) != b"%PDF-":
-                            raise _NonRetryableRequestError("下载的文件不是有效的 PDF")
-                if should_retry_after_release:
-                    await self._backoff_sleep(attempt)
-                    continue
-                break
-            except Exception as exc:
-                last_error = exc
-                self._remove_partial_file(target_path)
-                if isinstance(exc, _NonRetryableRequestError):
-                    break
-                if attempt < retry:
-                    logger.warning(
-                        "PDF 下载因异常触发重试：尝试=%s/%s 地址=%s 错误=%s",
-                        attempt,
-                        retry,
-                        safe_url,
-                        mask_sensitive_text(str(exc)),
-                    )
-                    await self._backoff_sleep(attempt)
-                    continue
-                break
-
-        if (not target_path.exists()) or target_path.stat().st_size <= 0:
-            if last_error is not None:
-                raise last_error
-            raise RuntimeError("下载后的 PDF 文件不存在")
-
-        return status_code, content_type
-
-    async def _read_response_preview(
-        self,
-        response: httpx.Response,
-        *,
-        max_bytes: int = 1024,
-        chunk_size: int = 256,
-        preview_chars: int = 300,
-    ) -> str:
-        preview = bytearray()
-        async for chunk in response.aiter_bytes(chunk_size=chunk_size):
-            if not chunk:
-                continue
-            remaining = max_bytes - len(preview)
-            if remaining <= 0:
-                break
-            preview.extend(chunk[:remaining])
-            if len(preview) >= max_bytes:
-                break
-        return self._decode_preview_bytes(preview, max_bytes=max_bytes, preview_chars=preview_chars)
+        options = HttpRequestOptions(timeout=timeout, retry=retry)
+        return await self._http_executor.download_pdf(
+            url=valid_signed_url,
+            target_path=target_path,
+            headers=self._build_download_headers(),
+            max_bytes=max_pdf_bytes,
+            options=options,
+        )
 
     async def _request_json(
         self,
@@ -240,90 +147,25 @@ class SupabaseClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        safe_url = self._mask_url(url)
         timeout, retry, headers = self._http_request_options()
-        client = await self._get_http_client()
-        last_error: Exception | None = None
-        for attempt in range(1, retry + 1):
-            try:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    params=params,
-                    json=json_body,
-                    headers=headers,
-                    follow_redirects=False,
-                    timeout=timeout,
-                )
-                if 300 <= response.status_code < 400:
-                    location = self._mask_url(str(response.headers.get("location", "")).strip())
-                    logger.warning(
-                        "Supabase 请求被重定向，已阻止：状态码=%s 地址=%s 跳转=%s",
-                        response.status_code,
-                        safe_url,
-                        location or "<缺失>",
-                    )
-                    raise _NonRetryableRequestError("Supabase 请求发生未预期的重定向")
-                if response.status_code >= 500 and attempt < retry:
-                    logger.warning(
-                        "HTTP 请求因状态码触发重试：状态码=%s 尝试=%s/%s 地址=%s",
-                        response.status_code,
-                        attempt,
-                        retry,
-                        safe_url,
-                    )
-                    await self._backoff_sleep(attempt)
-                    continue
-                if response.status_code >= 400:
-                    body_preview = self._decode_preview_bytes(response.content)
-                    logger.warning(
-                        "Supabase 请求 HTTP 错误：状态码=%s 地址=%s 响应=%s",
-                        response.status_code,
-                        safe_url,
-                        body_preview,
-                    )
-                    raise _NonRetryableRequestError(
-                        f"Supabase 请求返回 HTTP 错误：{response.status_code}",
-                    )
-                try:
-                    return response.json()
-                except Exception:
-                    body_preview = self._decode_preview_bytes(response.content)
-                    logger.warning(
-                        "Supabase 响应 JSON 解析失败：地址=%s 响应=%s",
-                        safe_url,
-                        body_preview,
-                    )
-                    raise _NonRetryableRequestError(
-                        "Supabase 响应 JSON 解析失败",
-                    )
-            except Exception as exc:
-                last_error = exc
-                if isinstance(exc, _NonRetryableRequestError):
-                    break
-                if attempt < retry:
-                    logger.warning(
-                        "HTTP 请求因异常触发重试：尝试=%s/%s 地址=%s 错误=%s",
-                        attempt,
-                        retry,
-                        safe_url,
-                        mask_sensitive_text(str(exc)),
-                    )
-                    await self._backoff_sleep(attempt)
-                    continue
-                break
-
-        assert last_error is not None
-        raise last_error
+        options = HttpRequestOptions(timeout=timeout, retry=retry)
+        return await self._http_executor.request_json(
+            method=method,
+            url=url,
+            params=params,
+            json_body=json_body,
+            headers=headers,
+            options=options,
+        )
 
     def _http_request_options(self) -> tuple[int, int, dict[str, str]]:
-        timeout = self._cfg_int("http_timeout_sec", 20, min_value=5)
-        retry = self._cfg_int("http_retry", 3, min_value=1)
+        timeout = self._cfg_int("http_timeout_sec", HTTP_TIMEOUT_DEFAULT_SEC, min_value=HTTP_TIMEOUT_MIN_SEC)
+        retry = self._cfg_int("http_retry", HTTP_RETRY_DEFAULT, min_value=HTTP_RETRY_MIN)
         headers = self._build_supabase_headers()
         return timeout, retry, headers
 
     async def _backoff_sleep(self, attempt: int) -> None:
-        delay = min(2 ** (attempt - 1), 8)
+        delay = min(BACKOFF_BASE_SECONDS ** (attempt - 1), BACKOFF_MAX_SECONDS)
         await asyncio.sleep(delay)
 
     async def _get_http_client(self) -> httpx.AsyncClient:
@@ -332,7 +174,10 @@ class SupabaseClient:
             if client is not None:
                 return client
 
-            limits = httpx.Limits(max_connections=16, max_keepalive_connections=16)
+            limits = httpx.Limits(
+                max_connections=MAX_CONNECTIONS,
+                max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+            )
             self._client = httpx.AsyncClient(limits=limits, follow_redirects=False)
             return self._client
 
@@ -349,22 +194,6 @@ class SupabaseClient:
         return {
             "Accept": "application/pdf",
         }
-
-    def _decode_preview_bytes(
-        self,
-        data: bytes | bytearray,
-        *,
-        max_bytes: int = 1024,
-        preview_chars: int = 300,
-    ) -> str:
-        preview_bytes = bytes(data[:max_bytes])
-        return mask_sensitive_text(preview_bytes[:preview_chars].decode("utf-8", errors="replace"))
-
-    def _remove_partial_file(self, target_path: Path) -> None:
-        try:
-            target_path.unlink(missing_ok=True)
-        except Exception:
-            logger.warning("删除未完成的下载文件失败：%s", str(target_path), exc_info=True)
 
     def _resolve_signed_url(self, supabase_url: str, signed: str) -> str:
         parsed = urlsplit(signed)
