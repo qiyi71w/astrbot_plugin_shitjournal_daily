@@ -26,7 +26,7 @@
     "description": "定时自动推送仅检查最新一篇论文",
     "type": "bool",
     "default": false,
-    "hint": "仅影响定时任务；开启后按群只检查各分区最新一篇论文，若主分区最新一篇已推送则继续检查候补分区最新一篇，不再回退同分区更早论文"
+    "hint": "仅影响定时任务；开启后按会话只检查各分区最新一篇论文，若主分区最新一篇已推送则继续检查候补分区最新一篇，不再回退同分区更早论文"
   },
   "detail_hide_domain": {
     "description": "详情仅显示 /preprints/路径",
@@ -43,13 +43,13 @@
     "description": "推送目标会话列表",
     "type": "list",
     "default": [],
-    "hint": "填写 unified_msg_origin，例如 aiocqhttp:GroupMessage:123456"
+    "hint": "填写 unified_msg_origin，例如 aiocqhttp:GroupMessage:123456 或 aiocqhttp:FriendMessage:123456"
   },
   "send_merge_forward": {
-    "description": "是否优先使用群合并转发发送",
+    "description": "是否优先使用 OneBot v11 合并转发发送",
     "type": "bool",
     "default": false,
-    "hint": "仅在运行时识别到 OneBot v11 群聊时启用；平台实例 ID 可自定义，无需额外配置平台类型；发送失败会自动回退为普通消息"
+    "hint": "仅在运行时识别到 OneBot v11 群聊或私聊时启用；平台实例 ID 可自定义，无需额外配置平台类型；发送失败会自动回退为普通消息"
   },
   "send_pdf": {
     "description": "是否附带 PDF 文件",
@@ -121,10 +121,10 @@
     "default": true
   },
   "chi_shi_group_cooldown_sec": {
-    "description": "“/我要赤石”群聊冷却时间（秒）",
+    "description": "“/我要赤石”会话冷却时间（秒）",
     "type": "int",
     "default": 60,
-    "hint": "按群聊独立计时，不同群互不影响"
+    "hint": "按会话独立计时，不同群聊/私聊会话互不影响"
   },
   "chi_shi_group_fail_cooldown_sec": {
     "description": "“/我要赤石”失败后冷却时间（秒）",
@@ -141,6 +141,6 @@
     "description": "“/我要赤石”已推送历史保留上限",
     "type": "int",
     "default": 30,
-    "hint": "仅在关闭全量保留时生效；按群聊和分区分别计数，保留最近 N 条"
+    "hint": "仅在关闭全量保留时生效；按会话和分区分别计数，保留最近 N 条"
   }
 }

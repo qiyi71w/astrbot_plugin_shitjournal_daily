@@ -13,6 +13,7 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.platform.message_type import MessageType
 
 try:
     from .services import PdfService, PushMessageService, SupabaseClient, TempFileManager
@@ -94,7 +95,7 @@ class RunSelectionError(RuntimeError):
 @register(
     "astrbot_plugin_shitjournal_daily",
     "AstrBot",
-    "定时推送 shitjournal 最新论文到群聊",
+    "定时推送 shitjournal 最新论文到会话",
     "1.0.0",
 )
 class ShitJournalDailyPlugin(Star):
@@ -242,7 +243,7 @@ class ShitJournalDailyPlugin(Star):
         *args: Any,
         **kwargs: Any,
     ):
-        """抓取最新论文并推送到当前群聊（按群冷却）"""
+        """抓取最新论文并推送到当前会话（按会话冷却）"""
         # 兼容 AstrBot 不同注入路径下的命令参数形态。
         normalized = self._normalize_command_event(
             event=event,
@@ -253,13 +254,12 @@ class ShitJournalDailyPlugin(Star):
         if not normalized:
             return
         event, _, _ = normalized
-
-        if not event.get_group_id():
-            yield event.plain_result("该指令仅支持群聊。")
-            return
-
+        scope_label = self._get_chi_shi_session_scope_text(event)
         session_key = event.unified_msg_origin
-        allowed, deny_reason = await self._try_enter_chi_shi_cooldown(session_key=session_key)
+        allowed, deny_reason = await self._try_enter_chi_shi_cooldown(
+            session_key=session_key,
+            scope_label=scope_label,
+        )
         if not allowed:
             yield event.plain_result(deny_reason)
             return
@@ -280,13 +280,14 @@ class ShitJournalDailyPlugin(Star):
                         self._build_chi_shi_failure_text(
                             saw_candidates=saw_candidates,
                             warnings=selection_warnings,
+                            scope_label=scope_label,
                         ),
                     )
                     return
                 if saw_candidates:
                     apply_success_cooldown = True
                     yield event.plain_result(
-                        f"本群{self._build_zone_scope_text(zone_order)}最近这些论文都推送过了，等下一篇。",
+                        f"{scope_label}{self._build_zone_scope_text(zone_order)}最近这些论文都推送过了，等下一篇。",
                     )
                     return
                 yield event.plain_result("未找到最新论文。")
@@ -433,19 +434,28 @@ class ShitJournalDailyPlugin(Star):
         admins = {item for item in normalized_admins if item}
         return sender_id in admins
 
+    def _get_chi_shi_session_scope_text(self, event: AstrMessageEvent) -> str:
+        if event.get_group_id():
+            return "本群"
+        session_key = str(getattr(event, "unified_msg_origin", "")).strip()
+        if f":{MessageType.FRIEND_MESSAGE.value}:" in session_key:
+            return "当前私聊"
+        return "当前会话"
+
     async def _try_enter_chi_shi_cooldown(
         self,
         session_key: str,
+        scope_label: str,
     ) -> tuple[bool, str]:
         async with self._chi_shi_cooldown_lock:
             if session_key in self._chi_shi_group_inflight:
-                return False, "本群已有赤石任务在执行，请稍后再试。"
+                return False, f"{scope_label}已有赤石任务在执行，请稍后再试。"
 
             now = time.monotonic()
             cooldown_until = float(self._chi_shi_group_cooldown_until_monotonic.get(session_key, 0.0))
             remaining = cooldown_until - now
             if remaining > 0:
-                return False, f"本群冷却中，请 {int(remaining + 0.999)} 秒后再试。"
+                return False, f"{scope_label}冷却中，请 {int(remaining + 0.999)} 秒后再试。"
 
             self._chi_shi_group_inflight.add(session_key)
             return True, ""
@@ -2169,9 +2179,15 @@ class ShitJournalDailyPlugin(Star):
         self._append_warning_lines(lines, warnings)
         return "\n".join(lines)
 
-    def _build_chi_shi_failure_text(self, *, saw_candidates: bool, warnings: list[str]) -> str:
+    def _build_chi_shi_failure_text(
+        self,
+        *,
+        saw_candidates: bool,
+        warnings: list[str],
+        scope_label: str,
+    ) -> str:
         if saw_candidates:
-            lines = ["抓取失败：回退过程中存在分区抓取失败，无法确认本群是否都已推送。"]
+            lines = [f"抓取失败：回退过程中存在分区抓取失败，无法确认{scope_label}是否都已推送。"]
         else:
             lines = ["抓取失败：已尝试所有可回退分区，但未能成功获取可推送论文。"]
         self._append_warning_lines(lines, warnings)

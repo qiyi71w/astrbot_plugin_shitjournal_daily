@@ -18,6 +18,10 @@ LOCAL_PDF_FILE_ADAPTERS = frozenset({
     SATORI_ADAPTER_NAME,
     LARK_ADAPTER_NAME,
 })
+ONEBOT_MERGE_FORWARD_MESSAGE_TYPES = frozenset({
+    MessageType.GROUP_MESSAGE,
+    MessageType.FRIEND_MESSAGE,
+})
 
 
 class PushMessageService:
@@ -228,9 +232,7 @@ class PushMessageService:
     def _should_try_merge_forward_for_event(self, event: AstrMessageEvent) -> bool:
         if not self._cfg_bool("send_merge_forward", False):
             return False
-        if not event.get_group_id():
-            return False
-        return event.get_platform_name() == ONEBOT_ADAPTER_NAME
+        return str(event.get_platform_name()).strip() == ONEBOT_ADAPTER_NAME
 
     def _resolve_merge_forward_platform(self, context: Any, session: str) -> Any | None:
         if not self._cfg_bool("send_merge_forward", False):
@@ -242,7 +244,7 @@ class PushMessageService:
             logger.warning("无法解析主动消息会话，回退普通消息：%s", session, exc_info=True)
             return None
 
-        if message_session.message_type != MessageType.GROUP_MESSAGE:
+        if message_session.message_type not in ONEBOT_MERGE_FORWARD_MESSAGE_TYPES:
             return None
 
         platform = self._find_platform_by_id(context, message_session.platform_name)
