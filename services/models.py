@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 
-class RunStatus(StrEnum):
+class RunStatus(str, Enum):
+    __str__ = str.__str__
+
     SUCCESS = "success"
     PARTIAL = "partial"
     FAILED = "failed"
@@ -14,7 +16,9 @@ class RunStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
-class RunReason(StrEnum):
+class RunReason(str, Enum):
+    __str__ = str.__str__
+
     RUN_IN_PROGRESS = "RUN_IN_PROGRESS"
     NO_TARGET_SESSION_CONFIGURED = "NO_TARGET_SESSION_CONFIGURED"
     FETCH_LATEST_FAILED = "FETCH_LATEST_FAILED"
