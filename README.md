@@ -1,5 +1,7 @@
 # astrbot_plugin_shitjournal_daily
 
+## SHIT期刊似乎死了？
+
 每日定时抓取 `shitjournal` 最新论文并推送到会话：
 - 推送文本元信息
 - 推送 PDF 第 1 页预览图
