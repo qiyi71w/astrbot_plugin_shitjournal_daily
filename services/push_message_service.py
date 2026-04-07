@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -8,6 +8,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 
 from .message_sink import EventMessageSink, MessageSink, OneBotPlatformResolver, SessionMessageSink
+from .napcat_stream_uploader import NapCatStreamUploader, STREAM_ACTION_NAME
 from .push_chain_builder import ONEBOT_ADAPTER_NAME, PushChainBuilder
 from .session_message import is_group_message_session, is_private_message_session
 
@@ -18,6 +19,7 @@ class PushPayload:
     png_file: Path
     pdf_file: Path
     pdf_url: str
+    pdf_send_file: str = ""
 
 
 class PushMessageService:
@@ -25,6 +27,7 @@ class PushMessageService:
         self._cfg_bool = cfg_bool_getter
         self._chains = PushChainBuilder(cfg_bool_getter=cfg_bool_getter)
         self._platforms = OneBotPlatformResolver(cfg_bool_getter=cfg_bool_getter)
+        self._stream_uploader = NapCatStreamUploader()
 
     def build_standard_chain(
         self,
@@ -41,6 +44,7 @@ class PushMessageService:
             png_file=payload.png_file,
             pdf_file=payload.pdf_file,
             pdf_url=payload.pdf_url,
+            pdf_send_file=payload.pdf_send_file,
         )
 
     def build_merge_forward_chain(
@@ -61,6 +65,7 @@ class PushMessageService:
             png_file=payload.png_file,
             pdf_file=payload.pdf_file,
             pdf_url=payload.pdf_url,
+            pdf_send_file=payload.pdf_send_file,
             sender_uin=sender_uin,
             include_pdf=include_pdf,
         )
@@ -76,6 +81,12 @@ class PushMessageService:
         adapter_name = str(event.get_platform_name()).strip()
         payload = PushPayload(text=text, png_file=png_file, pdf_file=pdf_file, pdf_url=pdf_url)
         sink = EventMessageSink(event=event)
+        payload = await self._resolve_onebot_pdf_send_file(
+            adapter_name=adapter_name,
+            payload=payload,
+            call_action=sink.get_onebot_call_action(),
+            target_label=f"event:{getattr(event, 'unified_msg_origin', '')}",
+        )
         if not self._should_try_merge_forward_for_event(event):
             await self._send_standard(sink=sink, adapter_name=adapter_name, payload=payload)
             return
@@ -91,6 +102,7 @@ class PushMessageService:
             png_file=payload.png_file,
             pdf_file=payload.pdf_file,
             pdf_url=payload.pdf_url,
+            pdf_send_file=payload.pdf_send_file,
             sender_uin=sender_uin,
             include_pdf=embed_pdf_in_merge,
         )
@@ -113,7 +125,14 @@ class PushMessageService:
     ) -> bool:
         adapter_name = self._platforms.resolve_platform_name(context, session)
         payload = PushPayload(text=text, png_file=png_file, pdf_file=pdf_file, pdf_url=pdf_url)
-        sink = SessionMessageSink(context=context, session=session)
+        stream_platform = self._platforms.resolve_platform(context, session)
+        sink = SessionMessageSink(context=context, session=session, platform=stream_platform)
+        payload = await self._resolve_onebot_pdf_send_file(
+            adapter_name=adapter_name,
+            payload=payload,
+            call_action=sink.get_onebot_call_action(),
+            target_label=f"session:{session}",
+        )
         platform = self._platforms.resolve_merge_forward_platform(context, session)
         if platform is None:
             return await self._send_standard(sink=sink, adapter_name=adapter_name, payload=payload)
@@ -128,6 +147,7 @@ class PushMessageService:
             png_file=payload.png_file,
             pdf_file=payload.pdf_file,
             pdf_url=payload.pdf_url,
+            pdf_send_file=payload.pdf_send_file,
             sender_uin=sender_uin,
             include_pdf=embed_pdf_in_merge,
         )
@@ -206,6 +226,7 @@ class PushMessageService:
             png_file=payload.png_file,
             pdf_file=payload.pdf_file,
             pdf_url=payload.pdf_url,
+            pdf_send_file=payload.pdf_send_file,
         ):
             if not await sink.send(chain):
                 sent_ok = False
@@ -224,6 +245,7 @@ class PushMessageService:
             adapter_name=adapter_name,
             pdf_file=payload.pdf_file,
             pdf_url=payload.pdf_url,
+            pdf_send_file=payload.pdf_send_file,
         )
         if chain is None:
             return True
@@ -237,6 +259,52 @@ class PushMessageService:
                 logger.warning(failed_message)
             return False
         return True
+
+    async def _resolve_onebot_pdf_send_file(
+        self,
+        *,
+        adapter_name: str,
+        payload: PushPayload,
+        call_action: Any,
+        target_label: str,
+    ) -> PushPayload:
+        if not self._should_try_stream_upload(adapter_name):
+            return payload
+        if not callable(call_action):
+            logger.warning(
+                "NapCat Stream API 调用入口不可用，回退默认 PDF 发送策略：目标=%s 动作=%s",
+                target_label,
+                STREAM_ACTION_NAME,
+            )
+            return payload
+        try:
+            stream_file = await self._stream_uploader.upload_pdf(call_action=call_action, pdf_file=payload.pdf_file)
+        except Exception:
+            logger.warning(
+                "NapCat Stream API 上传 PDF 失败，回退默认 PDF 发送策略：目标=%s 动作=%s",
+                target_label,
+                STREAM_ACTION_NAME,
+                exc_info=True,
+            )
+            return payload
+        stream_file = str(stream_file).strip()
+        if not stream_file:
+            logger.warning(
+                "NapCat Stream API 返回空 file_path，回退默认 PDF 发送策略：目标=%s 动作=%s",
+                target_label,
+                STREAM_ACTION_NAME,
+            )
+            return payload
+        logger.info(
+            "NapCat Stream API 上传成功，改用 file 发送 PDF：目标=%s 动作=%s 文件=%s",
+            target_label,
+            STREAM_ACTION_NAME,
+            stream_file,
+        )
+        return replace(payload, pdf_send_file=stream_file)
+
+    def _should_try_stream_upload(self, adapter_name: str) -> bool:
+        return self._cfg_bool("send_pdf", False) and str(adapter_name).strip() == ONEBOT_ADAPTER_NAME
 
     def _should_try_merge_forward_for_event(self, event: AstrMessageEvent) -> bool:
         if not self._cfg_bool("send_merge_forward", False):

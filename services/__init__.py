@@ -5,6 +5,7 @@ from importlib import import_module
 __all__ = [
     "SiteApiClient",
     "PdfService",
+    "NapCatStreamUploader",
     "PushMessageService",
     "TempFileManager",
     "AssetPipeline",
@@ -33,6 +34,8 @@ def __getattr__(name: str):
         return import_module(".site_api_client", __name__).SiteApiClient
     if name == "PdfService":
         return import_module(".pdf_service", __name__).PdfService
+    if name == "NapCatStreamUploader":
+        return import_module(".napcat_stream_uploader", __name__).NapCatStreamUploader
     if name == "PushMessageService":
         return import_module(".push_message_service", __name__).PushMessageService
     if name == "TempFileManager":

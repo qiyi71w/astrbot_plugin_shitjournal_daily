@@ -1,6 +1,6 @@
 # astrbot_plugin_shitjournal_daily
 
-## SHIT期刊似乎死了？
+## SHIT期刊似乎死了？目前插件需要科学上网才能正常使用
 
 每日定时抓取 `shitjournal` 最新论文并推送到会话：
 - 推送文本元信息
@@ -67,4 +67,5 @@
 - 开启 `detail_hide_domain` 后，定时推送、`/shitjournal run` 的执行结果以及 `/我要赤石` 推送里的“详情”会显示为 `/preprints/xxxx`，不再带 `https://shitjournal.org` 域名。
 - `chi_shi_keep_full_history=true` 时会完整保留每个会话、每个分区的已推送历史；关闭后仅保留最近 `chi_shi_history_limit` 条，更省存储，但更早的论文后续会被视为“未推送”。
 - 开启 `send_merge_forward` 后，定时推送、`/shitjournal run` 的论文内容推送以及 `/我要赤石` 会在运行时识别目标是否为 OneBot v11 群聊或私聊；群聊命中时会把正文、预览图与可选 PDF 放进同一个合并转发消息中，私聊命中时会把正文与预览图放进合并转发消息，并在启用 PDF 时紧接着补发一个普通 PDF 文件消息，未命中或发送失败时会自动回退为普通消息。
+- 对 `aiocqhttp` 发送 PDF 时会优先尝试 NapCat Stream API（`upload_file_stream`）；若 Stream 接口不可用、上传异常或返回缺少 `file_path`，会记录 warning 并显式回退 `File(url=...)` 发送。
 - `pdf_expire_days` 只影响 PDF；PNG 预览图仍按 `temp_keep_files` 数量上限清理。

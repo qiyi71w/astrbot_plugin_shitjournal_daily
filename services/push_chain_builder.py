@@ -34,6 +34,7 @@ class PushChainBuilder:
         png_file: Path,
         pdf_file: Path,
         pdf_url: str,
+        pdf_send_file: str = "",
     ) -> MessageEventResult:
         chain = MessageEventResult()
         chain.chain.extend(
@@ -43,6 +44,7 @@ class PushChainBuilder:
                 png_file=png_file,
                 pdf_file=pdf_file,
                 pdf_url=pdf_url,
+                pdf_send_file=pdf_send_file,
             ),
         )
         return chain
@@ -55,6 +57,7 @@ class PushChainBuilder:
         png_file: Path,
         pdf_file: Path,
         pdf_url: str,
+        pdf_send_file: str = "",
     ) -> list[MessageEventResult]:
         if not self._should_split_standard_file_send(adapter_name):
             return [
@@ -64,6 +67,7 @@ class PushChainBuilder:
                     png_file=png_file,
                     pdf_file=pdf_file,
                     pdf_url=pdf_url,
+                    pdf_send_file=pdf_send_file,
                 ),
             ]
         chains = [self._build_text_image_chain(text=text, png_file=png_file)]
@@ -71,6 +75,7 @@ class PushChainBuilder:
             adapter_name=adapter_name,
             pdf_file=pdf_file,
             pdf_url=pdf_url,
+            pdf_send_file=pdf_send_file,
         )
         if pdf_chain is not None:
             chains.append(pdf_chain)
@@ -84,6 +89,7 @@ class PushChainBuilder:
         png_file: Path,
         pdf_file: Path,
         pdf_url: str,
+        pdf_send_file: str = "",
         sender_uin: str,
         include_pdf: bool,
     ) -> MessageEventResult:
@@ -99,6 +105,7 @@ class PushChainBuilder:
                 adapter_name=adapter_name,
                 pdf_file=pdf_file,
                 pdf_url=pdf_url,
+                pdf_send_file=pdf_send_file,
             )
             if pdf_component is not None:
                 nodes.append(
@@ -118,11 +125,13 @@ class PushChainBuilder:
         adapter_name: str,
         pdf_file: Path,
         pdf_url: str,
+        pdf_send_file: str = "",
     ) -> MessageEventResult | None:
         pdf_component = self._build_pdf_component(
             adapter_name=adapter_name,
             pdf_file=pdf_file,
             pdf_url=pdf_url,
+            pdf_send_file=pdf_send_file,
         )
         if pdf_component is None:
             return None
@@ -138,12 +147,14 @@ class PushChainBuilder:
         png_file: Path,
         pdf_file: Path,
         pdf_url: str,
+        pdf_send_file: str = "",
     ) -> list[Any]:
         components: list[Any] = [Plain(text), Image.fromFileSystem(str(png_file))]
         pdf_component = self._build_pdf_component(
             adapter_name=adapter_name,
             pdf_file=pdf_file,
             pdf_url=pdf_url,
+            pdf_send_file=pdf_send_file,
         )
         if pdf_component is not None:
             components.append(pdf_component)
@@ -155,9 +166,12 @@ class PushChainBuilder:
         adapter_name: str,
         pdf_file: Path,
         pdf_url: str,
+        pdf_send_file: str = "",
     ) -> File | None:
         if not self._cfg_bool("send_pdf", False):
             return None
+        if pdf_send_file:
+            return File(name=pdf_file.name, file=pdf_send_file)
         if self._should_use_pdf_url(adapter_name) and pdf_url:
             return File(name=pdf_file.name, url=pdf_url)
         return File(name=pdf_file.name, file=str(pdf_file))

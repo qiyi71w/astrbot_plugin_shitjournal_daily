@@ -10,8 +10,15 @@ from astrbot.core.platform.message_session import MessageSesion
 from .push_chain_builder import ONEBOT_ADAPTER_NAME, ONEBOT_MERGE_FORWARD_MESSAGE_TYPES
 
 
+class OneBotCallAction(Protocol):
+    def __call__(self, action: str, **params: Any) -> Any: ...
+
+
 class MessageSink(Protocol):
     async def send(self, chain: MessageEventResult) -> bool:
+        ...
+
+    def get_onebot_call_action(self) -> OneBotCallAction | None:
         ...
 
 
@@ -23,14 +30,23 @@ class EventMessageSink:
         await self.event.send(chain)
         return True
 
+    def get_onebot_call_action(self) -> OneBotCallAction | None:
+        return resolve_call_action_from_bot(getattr(self.event, "bot", None))
+
 
 @dataclass(frozen=True)
 class SessionMessageSink:
     context: Any
     session: str
+    platform: Any | None = None
 
     async def send(self, chain: MessageEventResult) -> bool:
         return bool(await self.context.send_message(self.session, chain))
+
+    def get_onebot_call_action(self) -> OneBotCallAction | None:
+        if self.platform is None:
+            return None
+        return resolve_call_action_from_bot(getattr(self.platform, "bot", None))
 
 
 class OneBotPlatformResolver:
@@ -56,12 +72,14 @@ class OneBotPlatformResolver:
             return None
         return platform
 
+    def resolve_platform(self, context: Any, session: str) -> Any | None:
+        message_session = self._parse_message_session(session)
+        if message_session is None:
+            return None
+        return self._find_platform_by_id(context, message_session.platform_name)
+
     def resolve_platform_name(self, context: Any, session: str) -> str:
-        try:
-            message_session = MessageSesion.from_str(session)
-        except Exception:
-            return ""
-        platform = self._find_platform_by_id(context, message_session.platform_name)
+        platform = self.resolve_platform(context, session)
         if platform is None:
             return ""
         return str(platform.meta().name)
@@ -73,8 +91,8 @@ class OneBotPlatformResolver:
         if cached_self_id:
             return cached_self_id
         bot = getattr(platform, "bot", None)
-        call_action = getattr(bot, "call_action", None)
-        if not callable(call_action):
+        call_action = resolve_call_action_from_bot(bot)
+        if call_action is None:
             return ""
         try:
             login_info = await call_action("get_login_info")
@@ -104,6 +122,12 @@ class OneBotPlatformResolver:
                 return platform
         return None
 
+    def _parse_message_session(self, session: str) -> MessageSesion | None:
+        try:
+            return MessageSesion.from_str(session)
+        except Exception:
+            return None
+
     def _extract_user_id(self, login_info: Any) -> str:
         if not isinstance(login_info, dict):
             return ""
@@ -114,3 +138,14 @@ class OneBotPlatformResolver:
         if not isinstance(data, dict):
             return ""
         return str(data.get("user_id", "")).strip()
+
+
+def resolve_call_action_from_bot(bot: Any) -> OneBotCallAction | None:
+    direct_call_action = getattr(bot, "call_action", None)
+    if callable(direct_call_action):
+        return direct_call_action
+    api = getattr(bot, "api", None)
+    api_call_action = getattr(api, "call_action", None)
+    if callable(api_call_action):
+        return api_call_action
+    return None
