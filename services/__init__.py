@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 
 __all__ = [
-    "SupabaseClient",
+    "SiteApiClient",
     "PdfService",
     "PushMessageService",
     "TempFileManager",
@@ -29,8 +29,8 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    if name == "SupabaseClient":
-        return import_module(".supabase_client", __name__).SupabaseClient
+    if name == "SiteApiClient":
+        return import_module(".site_api_client", __name__).SiteApiClient
     if name == "PdfService":
         return import_module(".pdf_service", __name__).PdfService
     if name == "PushMessageService":

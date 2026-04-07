@@ -9,7 +9,7 @@
 - 可选以合并转发形式发送论文内容（OneBot v11 群聊/私聊；群聊可把 PDF 一并放进合并转发，私聊会单独补发 PDF）
 
 ## 特性
-- 使用 Supabase API 直接获取最新论文
+- 使用站点 API 获取最新论文，并通过 PDF API 下载文件
 - 多时点定时任务（每日多个 `HH:MM`）
 - 定时自动推送可切换为“只检查最新一篇论文”
 - 去重推送（按 `zone + paper_id`，已推送会自动回退到下一篇未推送论文）
@@ -35,13 +35,13 @@
 - `detail_hide_domain`：开启后“详情”仅显示 `/preprints/xxxx` 路径，默认 `false`
 - `timezone`：默认 `Asia/Shanghai`
 - `target_sessions`：会话列表（UMO）
-- `send_merge_forward`：是否优先使用 OneBot v11 合并转发发送，默认 `false`
-- `send_pdf`：是否附 PDF，默认 `false`
+- `send_merge_forward`：是否优先使用 OneBot v11 合并转发发送，默认 `true`
+- `send_pdf`：是否附 PDF，默认 `true`
 - `pdf_dpi`：转图 DPI，默认 `170`
 - `pdf_max_size_mb`：允许处理的 PDF 最大体积（MB），默认 `50`
 - `send_concurrency`：并发推送会话数，默认 `3`（建议 `1-5`，最大 `20`）
-- `supabase_url`：Supabase API 地址
-- `supabase_publishable_key`：Supabase Publishable Key（已内置默认值，可覆盖；也可用环境变量 `SUPABASE_PUBLISHABLE_KEY`）
+- `api_base_url`：站点 API 地址
+- `pdf_base_url`：PDF API 地址
 - `command_admin_only`：仅管理员可用命令，默认 `true`
 - `command_no_permission_reply`：无权限是否提示，默认 `true`
 - `chi_shi_group_cooldown_sec`：`/我要赤石` 会话冷却秒数，默认 `60`（不同会话独立计时；AstrBot 管理员触发时不受此冷却限制）
@@ -59,7 +59,7 @@
 ## 说明
 - 插件最低要求 AstrBot `4.9.2+`，并依赖该版本提供的官方插件 KV 存储能力。
 - 管理员身份依赖 AstrBot 全局 `admins_id` 配置。
-- 内置了默认 Supabase key；若需要可在插件配置或环境变量中覆盖。
+- 配置迁移规则：将 `supabase_url` 手动改为 `api_base_url`，并新增/使用 `pdf_base_url`；`supabase_publishable_key` 与 `supabase_bucket` 已删除且不再兼容。
 - `/我要赤石` 不受 `command_admin_only` 影响，默认所有人都可触发。
 - 开启 `enable_zone_fallback` 后，定时推送、`/shitjournal run` 和 `/我要赤石` 都会先尝试 `zone`，只有当前分区从新到旧都没有可推送论文时才依次尝试 `fallback_zones`。
 - 定时推送和 `/shitjournal run` 会按目标会话独立从新到旧查找目标分区第一篇未推送论文；某个会话命中后，本轮不会继续为该会话检查更早论文或候补分区；`/我要赤石` 仍保持按会话独立去重逻辑。
