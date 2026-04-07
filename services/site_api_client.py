@@ -29,6 +29,8 @@ MAX_CONNECTIONS = 16
 MAX_KEEPALIVE_CONNECTIONS = 16
 BACKOFF_BASE_SECONDS = 2
 BACKOFF_MAX_SECONDS = 8
+SUPPORTED_PROXY_SCHEMES = {"http", "https"}
+UNSUPPORTED_PROXY_SCHEME = "socks5"
 
 
 class SiteApiClient:
@@ -44,6 +46,7 @@ class SiteApiClient:
         self._default_api_base_url = default_api_base_url
         self._default_pdf_base_url = default_pdf_base_url
         self._client: httpx.AsyncClient | None = None
+        self._client_proxy_url: str | None = None
         self._client_lock = asyncio.Lock()
         self._http_executor = HttpExecutor(
             get_client=lambda: self._get_http_client(),
@@ -56,6 +59,7 @@ class SiteApiClient:
         async with self._client_lock:
             client = self._client
             self._client = None
+            self._client_proxy_url = None
             if client is None:
                 return
             try:
@@ -162,14 +166,30 @@ class SiteApiClient:
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         async with self._client_lock:
+            configured_proxy = self._get_configured_proxy_url()
             client = self._client
-            if client is not None:
+            if client is not None and configured_proxy == self._client_proxy_url:
                 return client
+            if client is not None:
+                self._client = None
+                self._client_proxy_url = None
+                try:
+                    await client.aclose()
+                except Exception:
+                    logger.warning("关闭 HTTP 客户端失败。", exc_info=True)
             limits = httpx.Limits(
                 max_connections=MAX_CONNECTIONS,
                 max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
             )
-            self._client = httpx.AsyncClient(limits=limits, follow_redirects=False)
+            client_options: dict[str, Any] = {
+                "limits": limits,
+                "follow_redirects": False,
+            }
+            if configured_proxy:
+                client_options["proxy"] = configured_proxy
+                client_options["trust_env"] = False
+            self._client = httpx.AsyncClient(**client_options)
+            self._client_proxy_url = configured_proxy
             return self._client
 
     def _normalize_site_article(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -364,3 +384,25 @@ class SiteApiClient:
         if parsed.query:
             return f"{base}?<已隐藏>"
         return base
+
+    def _get_configured_proxy_url(self) -> str | None:
+        raw_proxy = str(self._cfg("proxy_url", "") or "").strip()
+        if not raw_proxy:
+            return None
+        parsed = urlsplit(raw_proxy)
+        scheme = parsed.scheme.lower()
+        if scheme == UNSUPPORTED_PROXY_SCHEME:
+            raise RuntimeError("proxy_url 配置非法：暂不支持 socks5:// 代理，仅支持 http/https")
+        if scheme not in SUPPORTED_PROXY_SCHEMES:
+            raise RuntimeError("proxy_url 配置非法：仅支持 http/https 代理")
+        if not parsed.netloc:
+            raise RuntimeError("proxy_url 配置非法：必须为绝对代理 URL")
+        return urlunsplit(
+            (
+                scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            ),
+        )

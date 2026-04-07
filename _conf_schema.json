@@ -104,6 +104,12 @@
     "type": "string",
     "default": "https://files.shitjournal.org"
   },
+  "proxy_url": {
+    "description": "抓取/下载链路Proxy地址",
+    "type": "string",
+    "default": "",
+    "hint": "留空时沿用 httpx 环境代理行为；非空时优先使用该代理；仅支持 http/https，暂不支持 socks5"
+  },
   "command_admin_only": {
     "description": "仅管理员可使用插件指令",
     "type": "bool",

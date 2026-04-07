@@ -42,6 +42,7 @@
 - `send_concurrency`：并发推送会话数，默认 `3`（建议 `1-5`，最大 `20`）
 - `api_base_url`：站点 API 地址
 - `pdf_base_url`：PDF API 地址
+- `proxy_url`：插件访问 `api_base_url` / `pdf_base_url` 的代理地址；留空时沿用 `httpx` 环境代理行为，非空时优先使用该代理并禁用环境代理继承；仅支持 `http://` / `https://`，`socks5://` 会报错
 - `command_admin_only`：仅管理员可用命令，默认 `true`
 - `command_no_permission_reply`：无权限是否提示，默认 `true`
 - `chi_shi_group_cooldown_sec`：`/我要赤石` 会话冷却秒数，默认 `60`（不同会话独立计时；AstrBot 管理员触发时不受此冷却限制）
@@ -69,3 +70,5 @@
 - 开启 `send_merge_forward` 后，定时推送、`/shitjournal run` 的论文内容推送以及 `/我要赤石` 会在运行时识别目标是否为 OneBot v11 群聊或私聊；群聊命中时会把正文、预览图与可选 PDF 放进同一个合并转发消息中，私聊命中时会把正文与预览图放进合并转发消息，并在启用 PDF 时紧接着补发一个普通 PDF 文件消息，未命中或发送失败时会自动回退为普通消息。
 - 对 `aiocqhttp` 发送 PDF 时会优先尝试 NapCat Stream API（`upload_file_stream`）；若 Stream 接口不可用、上传异常或返回缺少 `file_path`，会记录 warning 并显式回退 `File(url=...)` 发送。
 - `pdf_expire_days` 只影响 PDF；PNG 预览图仍按 `temp_keep_files` 数量上限清理。
+- `proxy_url` 只影响插件内部抓取/下载链路（访问 `api_base_url` / `pdf_base_url` 的 HTTP 请求）；不会改变 NapCat Stream 上传、下游 `File(url=...)` 发送和“详情”链接构造逻辑。
+- Docker 注意：容器内的 `localhost` / `127.0.0.1` 指向容器自身，不是宿主机。若宿主机上有代理，请在 `proxy_url` 使用容器内可达地址，例如 `host.docker.internal` 或 Docker 网关地址。
