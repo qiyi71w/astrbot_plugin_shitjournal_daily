@@ -194,7 +194,7 @@ class SiteApiClient:
 
     def _normalize_site_article(self, payload: dict[str, Any]) -> dict[str, Any]:
         author = payload.get("author")
-        zone = str(payload.get("zones") or payload.get("zone") or "").strip()
+        zone = self._resolve_article_zone(payload)
         author_name = self._read_site_author_field(author, "display_name")
         institution = self._read_site_author_field(author, "institution")
         normalized = dict(payload)
@@ -206,6 +206,28 @@ class SiteApiClient:
         if "institution" not in normalized:
             normalized["institution"] = institution
         return normalized
+
+    def _resolve_article_zone(self, payload: dict[str, Any]) -> str:
+        zone = self._to_zone_text(payload.get("zone"))
+        if zone:
+            return zone
+        zones = payload.get("zones")
+        if isinstance(zones, list):
+            for item in zones:
+                candidate = self._to_zone_text(item)
+                if candidate:
+                    return candidate
+            return ""
+        return self._to_zone_text(zones)
+
+    def _to_zone_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value).strip()
+        return ""
 
     def _read_site_author_field(self, author: Any, field: str) -> str:
         if not isinstance(author, dict):

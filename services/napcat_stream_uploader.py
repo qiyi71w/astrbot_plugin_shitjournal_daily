@@ -5,8 +5,9 @@ import hashlib
 import inspect
 import uuid
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
+from .onebot_action import OneBotCallAction
 
 DEFAULT_CHUNK_SIZE_BYTES = 64 * 1024
 DEFAULT_FILE_RETENTION_MS = 30 * 1000
@@ -14,10 +15,6 @@ STREAM_ACTION_NAME = "upload_file_stream"
 STREAM_CHUNK_SUCCESS_STATUSES = frozenset({"chunk_received", "ok"})
 STREAM_COMPLETE_SUCCESS_STATUSES = frozenset({"file_complete", "ok"})
 STREAM_SUCCESS_TYPES = frozenset({"stream", "response"})
-
-
-class OneBotCallAction(Protocol):
-    def __call__(self, action: str, **params: Any) -> Any: ...
 
 
 class NapCatStreamUploader:

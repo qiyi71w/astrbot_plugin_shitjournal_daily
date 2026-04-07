@@ -7,11 +7,8 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 from astrbot.core.platform.message_session import MessageSesion
 
+from .onebot_action import OneBotCallAction, resolve_call_action_from_bot
 from .push_chain_builder import ONEBOT_ADAPTER_NAME, ONEBOT_MERGE_FORWARD_MESSAGE_TYPES
-
-
-class OneBotCallAction(Protocol):
-    def __call__(self, action: str, **params: Any) -> Any: ...
 
 
 class MessageSink(Protocol):
@@ -138,14 +135,3 @@ class OneBotPlatformResolver:
         if not isinstance(data, dict):
             return ""
         return str(data.get("user_id", "")).strip()
-
-
-def resolve_call_action_from_bot(bot: Any) -> OneBotCallAction | None:
-    direct_call_action = getattr(bot, "call_action", None)
-    if callable(direct_call_action):
-        return direct_call_action
-    api = getattr(bot, "api", None)
-    api_call_action = getattr(api, "call_action", None)
-    if callable(api_call_action):
-        return api_call_action
-    return None
