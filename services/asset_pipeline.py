@@ -18,7 +18,7 @@ META_PREVIEW_KEYS = (
     "avg_score",
     "rating_count",
     "weighted_score",
-    "pdf_path",
+    "pdf_url",
     "zone",
 )
 DEFAULT_DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
@@ -48,7 +48,7 @@ class AssetPipeline:
         self,
         *,
         fetch_submission_detail: Callable[[str], Awaitable[dict[str, Any]]],
-        create_signed_pdf_url: Callable[[str], Awaitable[str]],
+        resolve_pdf_download_url: Callable[[str], Awaitable[str]],
         download_pdf_file: Callable[[str, Path], Awaitable[tuple[int, str]]],
         build_output_paths: Callable[[str], tuple[Path, Path]],
         mark_in_use: Callable[[Path, Path], Awaitable[None]],
@@ -64,7 +64,7 @@ class AssetPipeline:
         zone_labels: dict[str, tuple[str, str]] | None = None,
     ):
         self._fetch_submission_detail = fetch_submission_detail
-        self._create_signed_pdf_url = create_signed_pdf_url
+        self._resolve_pdf_download_url = resolve_pdf_download_url
         self._download_pdf_file = download_pdf_file
         self._build_output_paths = build_output_paths
         self._mark_in_use = mark_in_use
@@ -98,23 +98,23 @@ class AssetPipeline:
     async def prepare_pdf_assets(self, payload: dict[str, Any], paper_id: str) -> tuple[Path, Path, str]:
         pdf_key = self._extract_pdf_key(payload)
         if not pdf_key:
-            raise RuntimeError("PDF 路径缺失")
+            raise RuntimeError("PDF URL 缺失")
 
-        signed_url = await self._load_signed_url(pdf_key)
-        if not signed_url:
-            raise RuntimeError("签名 URL 为空")
+        pdf_download_url = await self._load_pdf_download_url(pdf_key)
+        if not pdf_download_url:
+            raise RuntimeError("PDF 下载地址为空")
 
-        self._logger.info("已取得签名 PDF 地址：%s", self._mask_token(signed_url))
+        self._logger.info("已取得 PDF 下载地址：%s", self._mask_token(pdf_download_url))
         pdf_file, png_file = self._build_output_paths(paper_id)
         await self._mark_in_use(pdf_file, png_file)
 
         try:
-            await self._download_pdf(signed_url, pdf_file)
+            await self._download_pdf(pdf_download_url, pdf_file)
             self._ensure_pdf_size_limit(pdf_file)
             await self._export_first_page(pdf_file, png_file)
             png_size = png_file.stat().st_size if png_file.exists() else 0
             self._logger.info("PDF 首页预览图导出完成：文件=%s 字节数=%s", str(png_file), png_size)
-            return pdf_file, png_file, signed_url
+            return pdf_file, png_file, pdf_download_url
         except Exception:
             await self._release_temp_files(pdf_file, png_file)
             raise
@@ -169,20 +169,20 @@ class AssetPipeline:
             return path if path.startswith("/") else f"/{path}"
         return detail_text
 
-    async def _load_signed_url(self, pdf_key: str) -> str:
+    async def _load_pdf_download_url(self, pdf_key: str) -> str:
         try:
-            return await self._create_signed_pdf_url(pdf_key)
+            return await self._resolve_pdf_download_url(pdf_key)
         except Exception as exc:
             self._logger.error(
-                "生成签名 URL 失败：%s",
+                "解析 PDF 下载地址失败：%s",
                 self._mask_sensitive_text(str(exc)),
                 exc_info=True,
             )
-            raise RuntimeError("生成签名 URL 失败") from exc
+            raise RuntimeError("解析 PDF 下载地址失败") from exc
 
-    async def _download_pdf(self, signed_url: str, pdf_file: Path) -> None:
+    async def _download_pdf(self, pdf_download_url: str, pdf_file: Path) -> None:
         try:
-            pdf_status, pdf_type = await self._download_pdf_file(signed_url, pdf_file)
+            pdf_status, pdf_type = await self._download_pdf_file(pdf_download_url, pdf_file)
             self._logger.info("PDF 下载完成：状态码=%s 内容类型=%s", pdf_status, pdf_type)
         except Exception as exc:
             self._logger.error(
@@ -204,7 +204,7 @@ class AssetPipeline:
             raise RuntimeError("导出 PDF 首页预览图失败") from exc
 
     def _extract_pdf_key(self, payload: dict[str, Any]) -> str:
-        return str(payload.get("pdf_path") or payload.get("file_path") or "").strip()
+        return str(payload.get("pdf_url") or "").strip()
 
     def _format_datetime(self, value: Any) -> str:
         text = str(value or "").strip()

@@ -94,21 +94,21 @@
     "default": 0,
     "hint": "仅删除未占用且超过天数的 PDF；0 表示关闭按时间删除，PNG 仍只按临时文件数量清理"
   },
-  "supabase_url": {
-    "description": "Supabase API 地址",
+  "api_base_url": {
+    "description": "站点 API 地址",
     "type": "string",
-    "default": "https://bcgdqepzakcufaadgnda.supabase.co"
+    "default": "https://api.shitjournal.org"
   },
-  "supabase_publishable_key": {
-    "description": "Supabase Publishable Key",
+  "pdf_base_url": {
+    "description": "PDF API 地址",
     "type": "string",
-    "default": "sb_publishable_wHqWLjQwO2lMwkGLeBktng_Mk_xf5xd",
-    "hint": "默认值可用；也可在配置中覆盖，或通过环境变量 SUPABASE_PUBLISHABLE_KEY 提供"
+    "default": "https://files.shitjournal.org"
   },
-  "supabase_bucket": {
-    "description": "PDF 所在 Supabase Bucket",
+  "proxy_url": {
+    "description": "抓取/下载链路Proxy地址",
     "type": "string",
-    "default": "manuscripts"
+    "default": "",
+    "hint": "留空时沿用 httpx 环境代理行为；非空时优先使用该代理；仅支持 http/https，暂不支持 socks5"
   },
   "command_admin_only": {
     "description": "仅管理员可使用插件指令",

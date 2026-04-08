@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import sys
 import time
@@ -25,7 +24,7 @@ if __package__:
         RunBatchSender,
         RunCycleService,
         RunSelector,
-        SupabaseClient,
+        SiteApiClient,
         TempFileManager,
     )
     from .services.session_message import is_private_message_session
@@ -46,15 +45,15 @@ else:
         RunBatchSender,
         RunCycleService,
         RunSelector,
-        SupabaseClient,
+        SiteApiClient,
         TempFileManager,
     )
     from services.session_message import is_private_message_session
     from services.sensitive import mask_sensitive_text
 
 
-DEFAULT_SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co"
-DEFAULT_SUPABASE_BUCKET = "manuscripts"
+DEFAULT_API_BASE_URL = "https://api.shitjournal.org"
+DEFAULT_PDF_BASE_URL = "https://files.shitjournal.org"
 DETAIL_URL_BASE = "https://shitjournal.org"
 DEFAULT_ZONE = "stone"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
@@ -62,7 +61,6 @@ MAX_SEND_CONCURRENCY = 20
 MAX_BATCH_SEND_CONCURRENCY = 2
 RUN_FETCH_PAGE_SIZE = 20
 CHI_SHI_FETCH_PAGE_SIZE = 20
-SUPABASE_KEY_ENV_NAME = "SUPABASE_PUBLISHABLE_KEY"
 TEMP_TRIM_INTERVAL_SEC = 60
 DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "interdisciplinary": ("交叉", "Interdisciplinary"),
@@ -122,12 +120,11 @@ class ShitJournalDailyPlugin(Star):
         self._next_temp_trim_monotonic = 0.0
         self._plugin_data_dir = Path(".")
         self._temp_dir = Path(".")
-        self._supabase = SupabaseClient(
-            cfg_getter=self._cfg,
-            cfg_int_getter=self._cfg_int,
-            key_getter=self._get_supabase_key,
-            default_url=DEFAULT_SUPABASE_URL,
-            default_bucket=DEFAULT_SUPABASE_BUCKET,
+        self._site_api = SiteApiClient(
+            self._cfg,
+            self._cfg_int,
+            DEFAULT_API_BASE_URL,
+            DEFAULT_PDF_BASE_URL,
         )
         self._pdf_service = PdfService(cfg_int_getter=self._cfg_int)
         self._push_messages = PushMessageService(cfg_bool_getter=self._cfg_bool)
@@ -151,7 +148,7 @@ class ShitJournalDailyPlugin(Star):
 
     def _create_run_selector(self) -> RunSelector:
         return RunSelector(
-            fetch_latest_submissions=lambda zone, limit, offset: self._supabase.fetch_latest_submissions(
+            fetch_latest_submissions=lambda zone, limit, offset: self._site_api.fetch_latest_submissions(
                 zone,
                 limit,
                 offset,
@@ -169,9 +166,9 @@ class ShitJournalDailyPlugin(Star):
 
     def _create_asset_pipeline(self) -> AssetPipeline:
         return AssetPipeline(
-            fetch_submission_detail=self._supabase.fetch_submission_detail,
-            create_signed_pdf_url=self._supabase.create_signed_pdf_url,
-            download_pdf_file=self._supabase.download_pdf_file,
+            fetch_submission_detail=self._site_api.fetch_submission_detail,
+            resolve_pdf_download_url=self._site_api.resolve_pdf_download_url,
+            download_pdf_file=self._site_api.download_pdf_file,
             build_output_paths=self._temp_files.build_output_paths,
             mark_in_use=self._temp_files.mark_in_use,
             release_temp_files=self._temp_files.release,
@@ -308,7 +305,6 @@ class ShitJournalDailyPlugin(Star):
         self._plugin_data_dir = self._resolve_plugin_data_dir()
         self._temp_dir = self._plugin_data_dir / "tmp"
         self._temp_files.set_temp_dir(self._temp_dir)
-        self._ensure_supabase_key_or_raise()
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         await self._history_store.ensure_chi_shi_history_storage_ready()
         await self._cron_scheduler.clear_cron_jobs()
@@ -318,7 +314,7 @@ class ShitJournalDailyPlugin(Star):
 
     async def terminate(self):
         await self._cron_scheduler.clear_cron_jobs()
-        await self._supabase.close()
+        await self._site_api.close()
         logger.info("shitjournal_daily 插件已停止。")
 
     @filter.command("shitjournal")
@@ -481,20 +477,6 @@ class ShitJournalDailyPlugin(Star):
         ).strip() or "astrbot_plugin_shitjournal_daily"
         data_dir = StarTools.get_data_dir(plugin_name)
         return data_dir.resolve()
-
-    def _ensure_supabase_key_or_raise(self) -> None:
-        _ = self._get_supabase_key()
-
-    def _get_supabase_key(self) -> str:
-        key = str(self._cfg("supabase_publishable_key", "")).strip()
-        if not key:
-            key = str(os.getenv(SUPABASE_KEY_ENV_NAME, "")).strip()
-        if not key:
-            raise RuntimeError(
-                "缺少 supabase_publishable_key，请在插件配置或环境变量中设置 "
-                f"{SUPABASE_KEY_ENV_NAME}",
-            )
-        return key
 
     def _cfg(self, key: str, default: Any) -> Any:
         try:

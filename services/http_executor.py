@@ -33,11 +33,11 @@ class HttpStatusPolicy:
 
 
 JSON_STATUS_POLICY = HttpStatusPolicy(
-    redirect_message="Supabase 请求被重定向，已阻止：状态码=%s 地址=%s 跳转=%s",
-    redirect_error="Supabase 请求发生未预期的重定向",
+    redirect_message="API 请求被重定向，已阻止：状态码=%s 地址=%s 跳转=%s",
+    redirect_error="API 请求发生未预期的重定向",
     retry_message="HTTP 请求因状态码触发重试：状态码=%s 尝试=%s/%s 地址=%s",
-    error_message="Supabase 请求 HTTP 错误：状态码=%s 地址=%s 响应=%s",
-    error_prefix="Supabase 请求返回 HTTP 错误",
+    error_message="API 请求 HTTP 错误：状态码=%s 地址=%s 响应=%s",
+    error_prefix="API 请求返回 HTTP 错误",
 )
 PDF_STATUS_POLICY = HttpStatusPolicy(
     redirect_message="PDF 下载出现重定向，已阻止：状态码=%s 地址=%s 跳转=%s",
@@ -149,7 +149,7 @@ class HttpExecutor:
                         attempt,
                         retry,
                         safe_url,
-                        self._mask_text(str(exc)),
+                        self._describe_exception(exc),
                     )
                     await self._backoff_sleep(attempt)
                     continue
@@ -168,8 +168,8 @@ class HttpExecutor:
         try:
             return False, response.json()
         except Exception:
-            logger.warning("Supabase 响应 JSON 解析失败：地址=%s 响应=%s", safe_url, self._decode_preview_bytes(response.content))
-            raise NonRetryableRequestError("Supabase 响应 JSON 解析失败")
+            logger.warning("API 响应 JSON 解析失败：地址=%s 响应=%s", safe_url, self._decode_preview_bytes(response.content))
+            raise NonRetryableRequestError("API 响应 JSON 解析失败")
 
     async def _download_pdf_once(self, *, client: httpx.AsyncClient, url: str, target_path: Path, headers: dict[str, str], max_bytes: int, timeout: int, safe_url: str, attempt: int, retry: int) -> tuple[bool, tuple[int, str]]:
         async with client.stream(method="GET", url=url, headers=headers, follow_redirects=False, timeout=timeout) as response:
@@ -251,6 +251,10 @@ class HttpExecutor:
         preview_bytes = bytes(data[:PREVIEW_MAX_BYTES])
         text = preview_bytes[:PREVIEW_CHARS].decode("utf-8", errors="replace")
         return self._mask_text(text)
+
+    def _describe_exception(self, exc: Exception) -> str:
+        text = self._mask_text(str(exc).strip())
+        return text or type(exc).__name__
 
     def _raise_redirect_error(self, status_code: int, safe_url: str, location: Any, message: str, error_text: str) -> None:
         masked_location = self._mask_url(str(location).strip())
