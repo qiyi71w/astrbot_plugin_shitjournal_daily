@@ -5,19 +5,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-DETAIL_URL_BASE = "https://shitjournal.org"
+DETAIL_URL_BASE = "https://shitspace.xyz"
 SCORE_PRECISION = 4
 META_PREVIEW_KEYS = (
     "id",
     "manuscript_title",
     "author_name",
-    "institution",
     "discipline",
-    "viscosity",
     "created_at",
     "avg_score",
     "rating_count",
-    "weighted_score",
     "pdf_url",
     "zone",
 )
@@ -25,21 +22,26 @@ DEFAULT_DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "interdisciplinary": ("交叉", "Interdisciplinary"),
     "science": ("理", "Science"),
     "engineering": ("工", "Engineering"),
-    "medical": ("医", "Medical"),
     "agriculture": ("农", "Agriculture"),
-    "law_social": ("法社", "Law & Social"),
-    "humanities": ("文", "Humanities"),
-}
-DEFAULT_VISCOSITY_LABELS: dict[str, tuple[str, str]] = {
-    "stringy": ("拉丝型", "Stringy"),
-    "semi": ("半固态", "Semi-solid"),
-    "high-entropy": ("高熵态", "High-Entropy"),
+    "medicine": ("医", "Medicine"),
+    "economics": ("经", "Economics"),
+    "management": ("管", "Management"),
+    "law": ("法", "Law"),
+    "social": ("社", "Social"),
+    "literature": ("文", "Literature"),
+    "history": ("史", "History"),
+    "philosophy": ("哲", "Philosophy"),
+    "art": ("艺", "Art"),
+    "business": ("商", "Business"),
+    "mathematics": ("数", "Mathematics"),
 }
 DEFAULT_ZONE_LABELS: dict[str, tuple[str, str]] = {
     "latrine": ("旱厕", "The Latrine"),
     "septic": ("化粪池", "Septic Tank"),
     "stone": ("构石", "The Stone"),
     "sediment": ("沉淀区", "Sediment"),
+    "referendum": ("公投区", "Referendum"),
+    "published": ("已发表", "Published"),
 }
 
 
@@ -60,7 +62,6 @@ class AssetPipeline:
         detail_url_base: str = DETAIL_URL_BASE,
         detail_hide_domain: Callable[[], bool] | None = None,
         discipline_labels: dict[str, tuple[str, str]] | None = None,
-        viscosity_labels: dict[str, tuple[str, str]] | None = None,
         zone_labels: dict[str, tuple[str, str]] | None = None,
     ):
         self._fetch_submission_detail = fetch_submission_detail
@@ -76,7 +77,6 @@ class AssetPipeline:
         self._detail_url_base = str(detail_url_base).strip() or DETAIL_URL_BASE
         self._detail_hide_domain = detail_hide_domain or (lambda: False)
         self._discipline_labels = discipline_labels or DEFAULT_DISCIPLINE_LABELS
-        self._viscosity_labels = viscosity_labels or DEFAULT_VISCOSITY_LABELS
         self._zone_labels = zone_labels or DEFAULT_ZONE_LABELS
 
     async def load_submission_payload(
@@ -124,7 +124,7 @@ class AssetPipeline:
 
     def build_preprint_detail_url(self, paper_id: str) -> str:
         normalized_paper_id = str(paper_id).strip()
-        return f"{self._detail_url_base}/preprints/{normalized_paper_id}"
+        return f"{self._detail_url_base}/article/{normalized_paper_id}"
 
     def build_push_text(
         self,
@@ -135,13 +135,10 @@ class AssetPipeline:
     ) -> str:
         title = self._fallback_text(payload.get("manuscript_title"))
         author = self._fallback_text(payload.get("author_name"))
-        institution = self._fallback_text(payload.get("institution"))
         zone_text = self._format_bilingual_label(zone or payload.get("zone"), self._zone_labels)
         submitted = self._format_datetime(payload.get("created_at"))
         discipline = self._format_bilingual_label(payload.get("discipline"), self._discipline_labels)
-        viscosity = self._format_bilingual_label(payload.get("viscosity"), self._viscosity_labels)
         avg_score = self._format_number(payload.get("avg_score"))
-        weighted_score = self._format_number(payload.get("weighted_score"))
         rating_count = self._fallback_text(payload.get("rating_count"))
         detail_text = self._format_detail_text(detail_url)
         lines = [
@@ -149,11 +146,9 @@ class AssetPipeline:
             f"分区: {zone_text}",
             f"标题: {title}",
             f"作者: {author}",
-            f"单位: {institution}",
             f"提交时间: {submitted}",
             f"学科: {discipline}",
-            f"粘度: {viscosity}",
-            f"评分: 平均={avg_score}, 加权={weighted_score}, 票数={rating_count}",
+            f"评分: 平均={avg_score}, 票数={rating_count}",
             f"详情: {detail_text}",
         ]
         return "\n".join(lines)

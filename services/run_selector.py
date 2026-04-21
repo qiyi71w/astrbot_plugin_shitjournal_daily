@@ -5,10 +5,10 @@ from typing import Any, Awaitable, Callable
 from .models import RunBatch
 from .sensitive import mask_sensitive_text
 
-DETAIL_URL_BASE = "https://shitjournal.org"
+DETAIL_URL_BASE = "https://shitspace.xyz"
 META_PREVIEW_KEYS = (
-    "id", "manuscript_title", "author_name", "institution", "discipline", "viscosity",
-    "created_at", "avg_score", "rating_count", "weighted_score", "pdf_path", "zone",
+    "id", "manuscript_title", "author_name", "discipline",
+    "created_at", "avg_score", "rating_count", "pdf_path", "zone",
 )
 
 @dataclass(slots=True)
@@ -262,7 +262,7 @@ class RunSelector:
         return {session: set(history) for session, history in history_by_target.items()}
 
     def _build_preprint_detail_url(self, paper_id):
-        return f"{self._detail_url_base}/preprints/{str(paper_id).strip()}"
+        return f"{self._detail_url_base}/article/{str(paper_id).strip()}"
 
     def _build_zone_fetch_warning_text(self, *, zone, is_primary, offset, error):
         zone_type = "主分区" if is_primary else "候补分区"

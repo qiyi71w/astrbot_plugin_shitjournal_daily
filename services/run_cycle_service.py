@@ -48,6 +48,17 @@ class RunCycleService:
             return await self._run_cycle_locked(force=force, source=source, latest_only=latest_only)
 
     async def _run_cycle_locked(self, *, force: bool, source: str, latest_only: bool) -> RunReport:
+        try:
+            plan = await self.plan_run_cycle(force=force, source=source, latest_only=latest_only)
+            selection = plan.get("selection")
+            batch_reports: list[RunBatchReport] = []
+            if selection is not None and selection.batches:
+                batch_reports = await self._deliver_selected_run_batches(list(selection.batches))
+            return await self.finalize_run_cycle(plan=plan, batch_reports=batch_reports)
+        finally:
+            await self._trim_temp_files_after_run()
+
+    async def plan_run_cycle(self, *, force: bool, source: str, latest_only: bool = False) -> dict[str, Any]:
         primary_zone = self._get_primary_zone()
         zone_order = self._get_candidate_zones(primary_zone)
         report = self._build_run_cycle_report(
@@ -64,23 +75,64 @@ class RunCycleService:
             force,
             latest_only,
         )
-        try:
-            targets = await self._history_store.get_all_target_sessions(self._cfg_getter("target_sessions", []))
-            if not targets:
-                report.reason_code = RunReason.NO_TARGET_SESSION_CONFIGURED
-                return report
-            previous_last_seen, selection = await self._select_run_cycle_batches(
+        targets = await self._history_store.get_all_target_sessions(self._cfg_getter("target_sessions", []))
+        if not targets:
+            report.reason_code = RunReason.NO_TARGET_SESSION_CONFIGURED
+            return {
+                "report": report,
+                "primary_zone": primary_zone,
+                "previous_last_seen": {},
+                "selection": None,
+                "batches": [],
+            }
+        previous_last_seen, selection = await self._select_run_cycle_batches(
+            report=report,
+            zone_order=zone_order,
+            targets=targets,
+            force=force,
+            latest_only=latest_only,
+        )
+        if selection is not None:
+            report.warnings = list(selection.warnings)
+        return {
+            "report": report,
+            "primary_zone": primary_zone,
+            "previous_last_seen": previous_last_seen,
+            "selection": selection,
+            "batches": list(selection.batches) if selection is not None else [],
+        }
+
+    async def finalize_run_cycle(
+        self,
+        *,
+        plan: dict[str, Any],
+        batch_reports: list[RunBatchReport | dict[str, Any]] | None = None,
+    ) -> RunReport:
+        report = plan["report"]
+        selection = plan.get("selection")
+        if selection is None:
+            return report
+        if not selection.batches:
+            return await self._finalize_empty_run_selection(
                 report=report,
-                zone_order=zone_order,
-                targets=targets,
-                force=force,
-                latest_only=latest_only,
+                selection=selection,
+                previous_last_seen=dict(plan.get("previous_last_seen", {})),
             )
-            if selection is None:
-                return report
-            return await self._apply_selection(report, primary_zone, previous_last_seen, selection)
-        finally:
-            await self._trim_temp_files_after_run()
+        if batch_reports is None:
+            raise RuntimeError("run cycle finalize 缺少批次发送报告")
+        normalized_reports = [self._coerce_run_batch_report(item) for item in batch_reports]
+        primary_zone = str(plan.get("primary_zone", ""))
+        self._apply_run_batch_reports_to_report(report, normalized_reports, primary_zone)
+        await self._persist_last_seen_map_if_changed(
+            dict(plan.get("previous_last_seen", {})),
+            dict(selection.last_seen_map),
+        )
+        report.status, report.reason_code = self._resolve_run_batch_reports(
+            normalized_reports,
+            report.sent_ok,
+            report.sent_total,
+        )
+        return report
 
     async def _apply_selection(
         self,

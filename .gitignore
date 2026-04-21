@@ -209,3 +209,5 @@ __marimo__/
 .codex/environments/environment.toml
 
 tests/
+AGENTS.md
+docs/

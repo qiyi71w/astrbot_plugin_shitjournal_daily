@@ -14,7 +14,88 @@
     "description": "候补分区列表",
     "type": "list",
     "default": ["septic"],
-    "hint": "仅在开启分区回退后生效；可选分区为 latrine、septic、stone、sediment；按填写顺序依次尝试，自动跳过重复项和目标分区自身"
+    "hint": "仅在开启分区回退后生效；可选分区为 latrine、septic、stone、sediment、referendum、published；按填写顺序依次尝试，自动跳过重复项和目标分区自身"
+  },
+  "enable_article_push": {
+    "description": "是否启用论文推送流",
+    "type": "bool",
+    "default": true
+  },
+  "article_sort_latrine": {
+    "description": "论文 latrine 分区排序",
+    "type": "string",
+    "default": "newest",
+    "hint": "可选 newest、hottest、random"
+  },
+  "article_sort_septic": {
+    "description": "论文 septic 分区排序",
+    "type": "string",
+    "default": "random",
+    "hint": "可选 random、hottest、highest_rated"
+  },
+  "article_sort_sediment": {
+    "description": "论文 sediment 分区排序",
+    "type": "string",
+    "default": "newest",
+    "hint": "可选 newest"
+  },
+  "article_sort_stone": {
+    "description": "论文 stone 分区排序",
+    "type": "string",
+    "default": "highest_rated",
+    "hint": "可选 highest_rated、random"
+  },
+  "enable_questions_push": {
+    "description": "是否启用课题推送流",
+    "type": "bool",
+    "default": false
+  },
+  "article_question_bundle_mode": {
+    "description": "文章与课题发送组合模式",
+    "type": "string",
+    "default": "separate",
+    "hint": "separate=文章与课题独立发送；bundle_by_session=同一轮按会话合并文章与课题发送"
+  },
+  "questions_zone": {
+    "description": "课题主分区",
+    "type": "string",
+    "default": "latrine",
+    "hint": "可选 latrine、septic、sediment、stone"
+  },
+  "questions_enable_zone_fallback": {
+    "description": "课题主分区无新课题时是否回退候补分区",
+    "type": "bool",
+    "default": false
+  },
+  "questions_fallback_zones": {
+    "description": "课题候补分区列表",
+    "type": "list",
+    "default": ["septic"],
+    "hint": "仅在开启课题分区回退后生效；可选分区为 latrine、septic、sediment、stone；按填写顺序依次尝试，自动跳过重复项和主分区自身"
+  },
+  "questions_sort_latrine": {
+    "description": "课题 latrine 分区排序",
+    "type": "string",
+    "default": "newest",
+    "hint": "可选 newest、hottest、random"
+  },
+  "questions_sort_septic": {
+    "description": "课题 septic 分区排序",
+    "type": "string",
+    "default": "hottest",
+    "hint": "可选 hottest、highest_rated、random"
+  },
+  "questions_sort_sediment": {
+    "description": "课题 sediment 分区排序",
+    "type": "string",
+    "default": "newest",
+    "hint": "可选 newest"
+  },
+  "questions_sort_stone": {
+    "description": "课题 stone 分区排序",
+    "type": "string",
+    "default": "highest_rated",
+    "hint": "可选 highest_rated、random"
   },
   "schedule_times": {
     "description": "每日定时触发时间",
@@ -29,10 +110,10 @@
     "hint": "仅影响定时任务；开启后按会话只检查各分区最新一篇论文，若主分区最新一篇已推送则继续检查候补分区最新一篇，不再回退同分区更早论文"
   },
   "detail_hide_domain": {
-    "description": "详情仅显示 /preprints/路径",
+    "description": "详情仅显示站内路径",
     "type": "bool",
     "default": false,
-    "hint": "开启后，定时推送、[shitjournal 执行结果] 和 /我要赤石 推送里的“详情”会去掉前面的域名"
+    "hint": "开启后，定时推送、[shitjournal 执行结果] 和 /我要赤石 推送里的“详情”会去掉前面的域名，仅保留 /article 或 /question 路径"
   },
   "timezone": {
     "description": "定时任务时区",
@@ -97,12 +178,12 @@
   "api_base_url": {
     "description": "站点 API 地址",
     "type": "string",
-    "default": "https://api.shitjournal.org"
+    "default": "https://shitspace.xyz"
   },
   "pdf_base_url": {
     "description": "PDF API 地址",
     "type": "string",
-    "default": "https://files.shitjournal.org"
+    "default": "https://files.shitspace.xyz"
   },
   "proxy_url": {
     "description": "抓取/下载链路Proxy地址",
