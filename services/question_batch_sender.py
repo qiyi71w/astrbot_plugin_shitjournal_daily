@@ -11,6 +11,7 @@ from .question_constants import (
     QUESTION_DISCIPLINE_LABELS,
     QUESTION_EXCERPT_LIMIT,
     QUESTION_NORMALIZED_FIELDS,
+    QUESTION_REQUIRED_TEXT_FIELDS,
     QUESTION_ZONE_LABELS,
     to_text,
 )
@@ -291,9 +292,13 @@ class QuestionBatchSender:
     async def _load_question_payload(self, question_id: str) -> dict[str, Any]:
         payload = await self._fetch_question_detail(question_id)
         missing_fields = [field for field in QUESTION_NORMALIZED_FIELDS if field not in payload]
-        if missing_fields:
-            missing_text = ", ".join(missing_fields)
-            raise RuntimeError(f"课题详情缺少字段：id={question_id} fields={missing_text}")
+        empty_required_fields = [
+            field for field in QUESTION_REQUIRED_TEXT_FIELDS if not to_text(payload.get(field))
+        ]
+        if missing_fields or empty_required_fields:
+            fields = missing_fields + [field for field in empty_required_fields if field not in missing_fields]
+            missing_text = ", ".join(fields)
+            raise RuntimeError(f"课题详情缺少或为空字段：id={question_id} fields={missing_text}")
         return payload
 
     def _metric_text(self, value: Any) -> str:

@@ -19,6 +19,15 @@ QUESTION_NORMALIZED_FIELDS = (
     "tag",
     "zone",
 )
+QUESTION_REQUIRED_TEXT_FIELDS = (
+    "id",
+    "title",
+    "content",
+    "author_name",
+    "created_at",
+    "discipline",
+    "zone",
+)
 QUESTION_ALLOWED_SORTS = {
     "latrine": ("newest", "hottest", "random"),
     "septic": ("hottest", "highest_rated", "random"),

@@ -130,14 +130,18 @@ class QuestionRunCycleService:
                 fetch_page_size=self._run_fetch_page_size,
             )
         except QuestionSelectionError as exc:
-            return self._apply_selection_error(report, str(exc))
+            return self._apply_selection_error(
+                report,
+                self._coerce_selection_reason_code(exc.reason_code),
+                str(exc),
+            )
         except Exception as exc:
-            return self._apply_selection_error(report, str(exc))
+            return self._apply_selection_error(report, RunReason.FETCH_LATEST_FAILED, str(exc))
 
-    def _apply_selection_error(self, report: RunReport, message: str):
+    def _apply_selection_error(self, report: RunReport, reason_code: RunReason, message: str):
         masked_message = self._mask_sensitive_text(message)
         self._logger.error("questions 抓取失败：%s", masked_message, exc_info=True)
-        report.reason_code = RunReason.FETCH_LATEST_FAILED
+        report.reason_code = reason_code
         report.debug_reason = masked_message
         return None
 
@@ -178,3 +182,9 @@ class QuestionRunCycleService:
     async def _persist_last_seen_map_if_changed(self, previous_last_seen: dict[str, str], next_last_seen_map: dict[str, str]) -> None:
         if previous_last_seen != next_last_seen_map:
             await self._question_history_store.set_last_seen_map(next_last_seen_map)
+
+    def _coerce_selection_reason_code(self, value: str) -> RunReason:
+        try:
+            return RunReason(str(value).strip())
+        except ValueError:
+            return RunReason.FETCH_LATEST_FAILED

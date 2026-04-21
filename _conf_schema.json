@@ -1,227 +1,550 @@
 {
-  "zone": {
-    "description": "目标分区",
-    "type": "string",
-    "default": "stone",
-    "hint": "通常使用 stone"
+  "article": {
+    "description": "论文推送配置",
+    "type": "object",
+    "items": {
+      "enable_article_push": {
+        "description": "是否启用论文推送流",
+        "type": "bool",
+        "default": true
+      },
+      "zone": {
+        "description": "论文主分区",
+        "type": "string",
+        "default": "stone",
+        "options": ["latrine", "septic", "sediment", "stone", "referendum", "published"],
+        "hint": "可选 latrine（NPC）、septic（人上人）、sediment（拉完了）、stone（顶级）、referendum（夯（公投区））、published（已发表）；通常使用 stone"
+      },
+      "enable_zone_fallback": {
+        "description": "论文主分区无新稿时是否回退候补分区",
+        "type": "bool",
+        "default": false
+      },
+      "fallback_zones": {
+        "description": "论文候补分区列表",
+        "type": "list",
+        "default": ["septic"],
+        "hint": "仅在开启论文分区回退后生效；可选分区为 latrine（NPC）、septic（人上人）、sediment（拉完了）、stone（顶级）、referendum（夯（公投区））、published（已发表）；按填写顺序依次尝试，自动跳过重复项和论文主分区自身"
+      },
+      "article_sort_latrine": {
+        "description": "论文 latrine（NPC）分区排序",
+        "type": "string",
+        "default": "newest",
+        "options": ["newest", "hottest", "random"]
+      },
+      "article_sort_septic": {
+        "description": "论文 septic（人上人）分区排序",
+        "type": "string",
+        "default": "random",
+        "options": ["random", "hottest", "highest_rated"]
+      },
+      "article_sort_sediment": {
+        "description": "论文 sediment（拉完了）分区排序",
+        "type": "string",
+        "default": "newest",
+        "options": ["newest"]
+      },
+      "article_sort_stone": {
+        "description": "论文 stone（顶级）分区排序",
+        "type": "string",
+        "default": "highest_rated",
+        "options": ["highest_rated", "random"]
+      }
+    }
   },
-  "enable_zone_fallback": {
-    "description": "目标分区无新稿时是否回退候补分区",
-    "type": "bool",
-    "default": false
+  "question": {
+    "description": "课题推送配置",
+    "type": "object",
+    "items": {
+      "enable_questions_push": {
+        "description": "是否启用课题推送流",
+        "type": "bool",
+        "default": false
+      },
+      "questions_zone": {
+        "description": "课题主分区",
+        "type": "string",
+        "default": "latrine",
+        "options": ["latrine", "septic", "sediment", "stone"],
+        "hint": "可选 latrine（啥课题）、septic（是个课题）、sediment（不是课题）、stone（好课题）"
+      },
+      "questions_enable_zone_fallback": {
+        "description": "课题主分区无新课题时是否回退候补分区",
+        "type": "bool",
+        "default": false
+      },
+      "questions_fallback_zones": {
+        "description": "课题候补分区列表",
+        "type": "list",
+        "default": ["septic"],
+        "hint": "仅在开启课题分区回退后生效；可选分区为 latrine（啥课题）、septic（是个课题）、sediment（不是课题）、stone（好课题）；按填写顺序依次尝试，自动跳过重复项和课题主分区自身"
+      },
+      "questions_sort_latrine": {
+        "description": "课题 latrine（啥课题）分区排序",
+        "type": "string",
+        "default": "newest",
+        "options": ["newest", "hottest", "random"]
+      },
+      "questions_sort_septic": {
+        "description": "课题 septic（是个课题）分区排序",
+        "type": "string",
+        "default": "hottest",
+        "options": ["hottest", "highest_rated", "random"]
+      },
+      "questions_sort_sediment": {
+        "description": "课题 sediment（不是课题）分区排序",
+        "type": "string",
+        "default": "newest",
+        "options": ["newest"]
+      },
+      "questions_sort_stone": {
+        "description": "课题 stone（好课题）分区排序",
+        "type": "string",
+        "default": "highest_rated",
+        "options": ["highest_rated", "random"]
+      }
+    }
   },
-  "fallback_zones": {
-    "description": "候补分区列表",
-    "type": "list",
-    "default": ["septic"],
-    "hint": "仅在开启分区回退后生效；可选分区为 latrine、septic、stone、sediment、referendum、published；按填写顺序依次尝试，自动跳过重复项和目标分区自身"
+  "delivery": {
+    "description": "推送发送配置",
+    "type": "object",
+    "items": {
+      "target_sessions": {
+        "description": "推送目标会话列表",
+        "type": "list",
+        "default": [],
+        "hint": "填写 unified_msg_origin，例如 aiocqhttp:GroupMessage:123456 或 aiocqhttp:FriendMessage:123456"
+      },
+      "article_question_bundle_mode": {
+        "description": "论文与课题发送组合模式",
+        "type": "string",
+        "default": "separate",
+        "options": ["separate", "bundle_by_session"],
+        "hint": "separate=论文与课题独立发送；bundle_by_session=同一轮按会话合并论文与课题发送"
+      },
+      "send_merge_forward": {
+        "description": "是否优先使用 OneBot v11 合并转发发送",
+        "type": "bool",
+        "default": true,
+        "hint": "启用后 QQ 会发送合并消息；发送失败会自动回退为普通消息"
+      },
+      "send_pdf": {
+        "description": "是否附带 PDF 文件",
+        "type": "bool",
+        "default": true
+      },
+      "send_concurrency": {
+        "description": "并发推送会话数",
+        "type": "int",
+        "default": 3,
+        "hint": "同时向多少个目标会话发送消息，建议 1-5"
+      },
+      "detail_hide_domain": {
+        "description": "详情仅显示站内路径",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，定时推送、[shitjournal 执行结果] 和 /我要赤石 推送里的“详情”会去掉前面的域名，仅保留 /article 或 /question 路径"
+      }
+    }
+  },
+  "schedule": {
+    "description": "定时任务配置",
+    "type": "object",
+    "items": {
+      "schedule_times": {
+        "description": "每日定时触发时间",
+        "type": "list",
+        "default": ["09:00", "21:00"],
+        "hint": "支持多个 HH:MM，按本插件时区生效"
+      },
+      "schedule_latest_only": {
+        "description": "定时自动推送仅检查最新一篇论文",
+        "type": "bool",
+        "default": false,
+        "hint": "仅影响定时任务；开启后按会话只检查各分区最新一篇论文，若论文主分区最新一篇已推送则继续检查候补分区最新一篇，不再回退同分区更早论文"
+      },
+      "timezone": {
+        "description": "定时任务时区",
+        "type": "string",
+        "default": "Asia/Shanghai"
+      }
+    }
+  },
+  "site": {
+    "description": "站点接口配置",
+    "type": "object",
+    "items": {
+      "api_base_url": {
+        "description": "站点 API 地址",
+        "type": "string",
+        "default": "https://shitspace.xyz",
+        "hint": "默认地址：https://shitspace.xyz"
+      },
+      "pdf_base_url": {
+        "description": "PDF API 地址",
+        "type": "string",
+        "default": "https://files.shitspace.xyz",
+        "hint": "默认地址：https://files.shitspace.xyz"
+      },
+      "proxy_url": {
+        "description": "抓取/下载链路 Proxy 地址",
+        "type": "string",
+        "default": "",
+        "hint": "留空时沿用 httpx 环境代理行为；非空时优先使用该代理；仅支持 http/https，暂不支持 socks5"
+      },
+      "http_timeout_sec": {
+        "description": "HTTP 请求超时（秒）",
+        "type": "int",
+        "default": 20
+      },
+      "http_retry": {
+        "description": "HTTP 请求重试次数",
+        "type": "int",
+        "default": 3
+      }
+    }
+  },
+  "assets": {
+    "description": "资源处理配置",
+    "type": "object",
+    "items": {
+      "pdf_dpi": {
+        "description": "PDF 第 1 页转图 DPI",
+        "type": "int",
+        "default": 170
+      },
+      "pdf_max_size_mb": {
+        "description": "允许处理的 PDF 最大体积（MB）",
+        "type": "int",
+        "default": 50,
+        "hint": "超过此大小将拒绝处理，避免异常大文件占用过多内存"
+      },
+      "temp_keep_files": {
+        "description": "临时文件最多保留数量",
+        "type": "int",
+        "default": 30
+      },
+      "pdf_expire_days": {
+        "description": "PDF 临时文件过期天数",
+        "type": "int",
+        "default": 0,
+        "hint": "仅删除未占用且超过天数的 PDF；0 表示关闭按时间删除，PNG 仍只按临时文件数量清理"
+      }
+    }
+  },
+  "commands": {
+    "description": "指令行为配置",
+    "type": "object",
+    "items": {
+      "command_admin_only": {
+        "description": "仅管理员可使用插件指令",
+        "type": "bool",
+        "default": true
+      },
+      "command_no_permission_reply": {
+        "description": "权限不足时是否提示",
+        "type": "bool",
+        "default": true
+      },
+      "chi_shi_group_cooldown_sec": {
+        "description": "“/我要赤石”会话冷却时间（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "按会话独立计时，不同群聊/私聊会话互不影响"
+      },
+      "chi_shi_group_fail_cooldown_sec": {
+        "description": "“/我要赤石”失败后冷却时间（秒）",
+        "type": "int",
+        "default": 10,
+        "hint": "抓取失败后仍施加短冷却，避免重试风暴"
+      },
+      "chi_shi_keep_full_history": {
+        "description": "“/我要赤石”是否全量保留已推送历史",
+        "type": "bool",
+        "default": true
+      },
+      "chi_shi_history_limit": {
+        "description": "“/我要赤石”已推送历史保留上限",
+        "type": "int",
+        "default": 30,
+        "hint": "仅在关闭全量保留时生效；按会话和分区分别计数，保留最近 N 条"
+      }
+    }
   },
   "enable_article_push": {
     "description": "是否启用论文推送流",
     "type": "bool",
-    "default": true
+    "default": true,
+    "invisible": true
+  },
+  "zone": {
+    "description": "论文主分区",
+    "type": "string",
+    "default": "stone",
+    "options": ["latrine", "septic", "sediment", "stone", "referendum", "published"],
+    "hint": "可选 latrine（NPC）、septic（人上人）、sediment（拉完了）、stone（顶级）、referendum（夯（公投区））、published（已发表）；通常使用 stone",
+    "invisible": true
+  },
+  "enable_zone_fallback": {
+    "description": "论文主分区无新稿时是否回退候补分区",
+    "type": "bool",
+    "default": false,
+    "invisible": true
+  },
+  "fallback_zones": {
+    "description": "论文候补分区列表",
+    "type": "list",
+    "default": ["septic"],
+    "hint": "仅在开启论文分区回退后生效；可选分区为 latrine（NPC）、septic（人上人）、sediment（拉完了）、stone（顶级）、referendum（夯（公投区））、published（已发表）；按填写顺序依次尝试，自动跳过重复项和论文主分区自身",
+    "invisible": true
   },
   "article_sort_latrine": {
-    "description": "论文 latrine 分区排序",
+    "description": "论文 latrine（NPC）分区排序",
     "type": "string",
     "default": "newest",
-    "hint": "可选 newest、hottest、random"
+    "options": ["newest", "hottest", "random"],
+    "invisible": true
   },
   "article_sort_septic": {
-    "description": "论文 septic 分区排序",
+    "description": "论文 septic（人上人）分区排序",
     "type": "string",
     "default": "random",
-    "hint": "可选 random、hottest、highest_rated"
+    "options": ["random", "hottest", "highest_rated"],
+    "invisible": true
   },
   "article_sort_sediment": {
-    "description": "论文 sediment 分区排序",
+    "description": "论文 sediment（拉完了）分区排序",
     "type": "string",
     "default": "newest",
-    "hint": "可选 newest"
+    "options": ["newest"],
+    "invisible": true
   },
   "article_sort_stone": {
-    "description": "论文 stone 分区排序",
+    "description": "论文 stone（顶级）分区排序",
     "type": "string",
     "default": "highest_rated",
-    "hint": "可选 highest_rated、random"
+    "options": ["highest_rated", "random"],
+    "invisible": true
   },
   "enable_questions_push": {
     "description": "是否启用课题推送流",
     "type": "bool",
-    "default": false
-  },
-  "article_question_bundle_mode": {
-    "description": "文章与课题发送组合模式",
-    "type": "string",
-    "default": "separate",
-    "hint": "separate=文章与课题独立发送；bundle_by_session=同一轮按会话合并文章与课题发送"
+    "default": false,
+    "invisible": true
   },
   "questions_zone": {
     "description": "课题主分区",
     "type": "string",
     "default": "latrine",
-    "hint": "可选 latrine、septic、sediment、stone"
+    "options": ["latrine", "septic", "sediment", "stone"],
+    "hint": "可选 latrine（啥课题）、septic（是个课题）、sediment（不是课题）、stone（好课题）",
+    "invisible": true
   },
   "questions_enable_zone_fallback": {
     "description": "课题主分区无新课题时是否回退候补分区",
     "type": "bool",
-    "default": false
+    "default": false,
+    "invisible": true
   },
   "questions_fallback_zones": {
     "description": "课题候补分区列表",
     "type": "list",
     "default": ["septic"],
-    "hint": "仅在开启课题分区回退后生效；可选分区为 latrine、septic、sediment、stone；按填写顺序依次尝试，自动跳过重复项和主分区自身"
+    "hint": "仅在开启课题分区回退后生效；可选分区为 latrine（啥课题）、septic（是个课题）、sediment（不是课题）、stone（好课题）；按填写顺序依次尝试，自动跳过重复项和课题主分区自身",
+    "invisible": true
   },
   "questions_sort_latrine": {
-    "description": "课题 latrine 分区排序",
+    "description": "课题 latrine（啥课题）分区排序",
     "type": "string",
     "default": "newest",
-    "hint": "可选 newest、hottest、random"
+    "options": ["newest", "hottest", "random"],
+    "invisible": true
   },
   "questions_sort_septic": {
-    "description": "课题 septic 分区排序",
+    "description": "课题 septic（是个课题）分区排序",
     "type": "string",
     "default": "hottest",
-    "hint": "可选 hottest、highest_rated、random"
+    "options": ["hottest", "highest_rated", "random"],
+    "invisible": true
   },
   "questions_sort_sediment": {
-    "description": "课题 sediment 分区排序",
+    "description": "课题 sediment（不是课题）分区排序",
     "type": "string",
     "default": "newest",
-    "hint": "可选 newest"
+    "options": ["newest"],
+    "invisible": true
   },
   "questions_sort_stone": {
-    "description": "课题 stone 分区排序",
+    "description": "课题 stone（好课题）分区排序",
     "type": "string",
     "default": "highest_rated",
-    "hint": "可选 highest_rated、random"
+    "options": ["highest_rated", "random"],
+    "invisible": true
   },
-  "schedule_times": {
-    "description": "每日定时触发时间",
-    "type": "list",
-    "default": ["09:00", "21:00"],
-    "hint": "支持多个 HH:MM，按本插件时区生效"
-  },
-  "schedule_latest_only": {
-    "description": "定时自动推送仅检查最新一篇论文",
-    "type": "bool",
-    "default": false,
-    "hint": "仅影响定时任务；开启后按会话只检查各分区最新一篇论文，若主分区最新一篇已推送则继续检查候补分区最新一篇，不再回退同分区更早论文"
-  },
-  "detail_hide_domain": {
-    "description": "详情仅显示站内路径",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，定时推送、[shitjournal 执行结果] 和 /我要赤石 推送里的“详情”会去掉前面的域名，仅保留 /article 或 /question 路径"
-  },
-  "timezone": {
-    "description": "定时任务时区",
+  "article_question_bundle_mode": {
+    "description": "论文与课题发送组合模式",
     "type": "string",
-    "default": "Asia/Shanghai"
-  },
-  "target_sessions": {
-    "description": "推送目标会话列表",
-    "type": "list",
-    "default": [],
-    "hint": "填写 unified_msg_origin，例如 aiocqhttp:GroupMessage:123456 或 aiocqhttp:FriendMessage:123456"
+    "default": "separate",
+    "options": ["separate", "bundle_by_session"],
+    "hint": "separate=论文与课题独立发送；bundle_by_session=同一轮按会话合并论文与课题发送",
+    "invisible": true
   },
   "send_merge_forward": {
     "description": "是否优先使用 OneBot v11 合并转发发送",
     "type": "bool",
     "default": true,
-    "hint": "启用后QQ会发送合并消息；发送失败会自动回退为普通消息"
+    "hint": "启用后 QQ 会发送合并消息；发送失败会自动回退为普通消息",
+    "invisible": true
   },
   "send_pdf": {
     "description": "是否附带 PDF 文件",
     "type": "bool",
-    "default": true
+    "default": true,
+    "invisible": true
   },
-  "pdf_dpi": {
-    "description": "PDF 第1页转图 DPI",
-    "type": "int",
-    "default": 170
-  },
-  "pdf_max_size_mb": {
-    "description": "允许处理的 PDF 最大体积（MB）",
-    "type": "int",
-    "default": 50,
-    "hint": "超过此大小将拒绝处理，避免异常大文件占用过多内存"
-  },
-  "http_timeout_sec": {
-    "description": "HTTP 请求超时（秒）",
-    "type": "int",
-    "default": 20
-  },
-  "http_retry": {
-    "description": "HTTP 请求重试次数",
-    "type": "int",
-    "default": 3
+  "target_sessions": {
+    "description": "推送目标会话列表",
+    "type": "list",
+    "default": [],
+    "hint": "填写 unified_msg_origin，例如 aiocqhttp:GroupMessage:123456 或 aiocqhttp:FriendMessage:123456",
+    "invisible": true
   },
   "send_concurrency": {
     "description": "并发推送会话数",
     "type": "int",
     "default": 3,
-    "hint": "同时向多少个目标会话发送消息，建议 1-5"
+    "hint": "同时向多少个目标会话发送消息，建议 1-5",
+    "invisible": true
+  },
+  "detail_hide_domain": {
+    "description": "详情仅显示站内路径",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，定时推送、[shitjournal 执行结果] 和 /我要赤石 推送里的“详情”会去掉前面的域名，仅保留 /article 或 /question 路径",
+    "invisible": true
+  },
+  "schedule_times": {
+    "description": "每日定时触发时间",
+    "type": "list",
+    "default": ["09:00", "21:00"],
+    "hint": "支持多个 HH:MM，按本插件时区生效",
+    "invisible": true
+  },
+  "schedule_latest_only": {
+    "description": "定时自动推送仅检查最新一篇论文",
+    "type": "bool",
+    "default": false,
+    "hint": "仅影响定时任务；开启后按会话只检查各分区最新一篇论文，若论文主分区最新一篇已推送则继续检查候补分区最新一篇，不再回退同分区更早论文",
+    "invisible": true
+  },
+  "timezone": {
+    "description": "定时任务时区",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "invisible": true
+  },
+  "pdf_dpi": {
+    "description": "PDF 第 1 页转图 DPI",
+    "type": "int",
+    "default": 170,
+    "invisible": true
+  },
+  "pdf_max_size_mb": {
+    "description": "允许处理的 PDF 最大体积（MB）",
+    "type": "int",
+    "default": 50,
+    "hint": "超过此大小将拒绝处理，避免异常大文件占用过多内存",
+    "invisible": true
   },
   "temp_keep_files": {
     "description": "临时文件最多保留数量",
     "type": "int",
-    "default": 30
+    "default": 30,
+    "invisible": true
   },
   "pdf_expire_days": {
     "description": "PDF 临时文件过期天数",
     "type": "int",
     "default": 0,
-    "hint": "仅删除未占用且超过天数的 PDF；0 表示关闭按时间删除，PNG 仍只按临时文件数量清理"
+    "hint": "仅删除未占用且超过天数的 PDF；0 表示关闭按时间删除，PNG 仍只按临时文件数量清理",
+    "invisible": true
   },
   "api_base_url": {
     "description": "站点 API 地址",
     "type": "string",
-    "default": "https://shitspace.xyz"
+    "default": "https://shitspace.xyz",
+    "hint": "默认地址：https://shitspace.xyz",
+    "invisible": true
   },
   "pdf_base_url": {
     "description": "PDF API 地址",
     "type": "string",
-    "default": "https://files.shitspace.xyz"
+    "default": "https://files.shitspace.xyz",
+    "hint": "默认地址：https://files.shitspace.xyz",
+    "invisible": true
   },
   "proxy_url": {
-    "description": "抓取/下载链路Proxy地址",
+    "description": "抓取/下载链路 Proxy 地址",
     "type": "string",
     "default": "",
-    "hint": "留空时沿用 httpx 环境代理行为；非空时优先使用该代理；仅支持 http/https，暂不支持 socks5"
+    "hint": "留空时沿用 httpx 环境代理行为；非空时优先使用该代理；仅支持 http/https，暂不支持 socks5",
+    "invisible": true
+  },
+  "http_timeout_sec": {
+    "description": "HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 20,
+    "invisible": true
+  },
+  "http_retry": {
+    "description": "HTTP 请求重试次数",
+    "type": "int",
+    "default": 3,
+    "invisible": true
   },
   "command_admin_only": {
     "description": "仅管理员可使用插件指令",
     "type": "bool",
-    "default": true
+    "default": true,
+    "invisible": true
   },
   "command_no_permission_reply": {
     "description": "权限不足时是否提示",
     "type": "bool",
-    "default": true
+    "default": true,
+    "invisible": true
   },
   "chi_shi_group_cooldown_sec": {
     "description": "“/我要赤石”会话冷却时间（秒）",
     "type": "int",
     "default": 60,
-    "hint": "按会话独立计时，不同群聊/私聊会话互不影响"
+    "hint": "按会话独立计时，不同群聊/私聊会话互不影响",
+    "invisible": true
   },
   "chi_shi_group_fail_cooldown_sec": {
     "description": "“/我要赤石”失败后冷却时间（秒）",
     "type": "int",
     "default": 10,
-    "hint": "抓取失败后仍施加短冷却，避免重试风暴"
+    "hint": "抓取失败后仍施加短冷却，避免重试风暴",
+    "invisible": true
   },
   "chi_shi_keep_full_history": {
     "description": "“/我要赤石”是否全量保留已推送历史",
     "type": "bool",
-    "default": true
+    "default": true,
+    "invisible": true
   },
   "chi_shi_history_limit": {
     "description": "“/我要赤石”已推送历史保留上限",
     "type": "int",
     "default": 30,
-    "hint": "仅在关闭全量保留时生效；按会话和分区分别计数，保留最近 N 条"
+    "hint": "仅在关闭全量保留时生效；按会话和分区分别计数，保留最近 N 条",
+    "invisible": true
+  },
+  "config_migration_flat_to_nested_done": {
+    "description": "flat 到 nested 配置迁移标记",
+    "type": "bool",
+    "default": false,
+    "invisible": true
   }
 }

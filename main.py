@@ -4,6 +4,7 @@ import asyncio
 import re
 import sys
 import time
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -106,13 +107,99 @@ DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "mathematics": ("数", "Mathematics"),
 }
 ZONE_LABELS: dict[str, tuple[str, str]] = {
-    "latrine": ("旱厕", "The Latrine"),
-    "septic": ("化粪池", "Septic Tank"),
-    "stone": ("构石", "The Stone"),
-    "sediment": ("沉淀区", "Sediment"),
-    "referendum": ("公投区", "Referendum"),
+    "latrine": ("NPC", "The Latrine"),
+    "septic": ("人上人", "Septic Tank"),
+    "stone": ("顶级", "The Stone"),
+    "sediment": ("拉完了", "Sediment"),
+    "referendum": ("夯（公投区）", "Referendum"),
     "published": ("已发表", "Published"),
 }
+FLAT_TO_NESTED_CONFIG_PATHS: dict[str, str] = {
+    "zone": "article.zone",
+    "enable_zone_fallback": "article.enable_zone_fallback",
+    "fallback_zones": "article.fallback_zones",
+    "enable_article_push": "article.enable_article_push",
+    "article_sort_latrine": "article.article_sort_latrine",
+    "article_sort_septic": "article.article_sort_septic",
+    "article_sort_sediment": "article.article_sort_sediment",
+    "article_sort_stone": "article.article_sort_stone",
+    "enable_questions_push": "question.enable_questions_push",
+    "article_question_bundle_mode": "delivery.article_question_bundle_mode",
+    "questions_zone": "question.questions_zone",
+    "questions_enable_zone_fallback": "question.questions_enable_zone_fallback",
+    "questions_fallback_zones": "question.questions_fallback_zones",
+    "questions_sort_latrine": "question.questions_sort_latrine",
+    "questions_sort_septic": "question.questions_sort_septic",
+    "questions_sort_sediment": "question.questions_sort_sediment",
+    "questions_sort_stone": "question.questions_sort_stone",
+    "schedule_times": "schedule.schedule_times",
+    "schedule_latest_only": "schedule.schedule_latest_only",
+    "detail_hide_domain": "delivery.detail_hide_domain",
+    "timezone": "schedule.timezone",
+    "target_sessions": "delivery.target_sessions",
+    "send_merge_forward": "delivery.send_merge_forward",
+    "send_pdf": "delivery.send_pdf",
+    "pdf_dpi": "assets.pdf_dpi",
+    "pdf_max_size_mb": "assets.pdf_max_size_mb",
+    "http_timeout_sec": "site.http_timeout_sec",
+    "http_retry": "site.http_retry",
+    "send_concurrency": "delivery.send_concurrency",
+    "temp_keep_files": "assets.temp_keep_files",
+    "pdf_expire_days": "assets.pdf_expire_days",
+    "api_base_url": "site.api_base_url",
+    "pdf_base_url": "site.pdf_base_url",
+    "proxy_url": "site.proxy_url",
+    "command_admin_only": "commands.command_admin_only",
+    "command_no_permission_reply": "commands.command_no_permission_reply",
+    "chi_shi_group_cooldown_sec": "commands.chi_shi_group_cooldown_sec",
+    "chi_shi_group_fail_cooldown_sec": "commands.chi_shi_group_fail_cooldown_sec",
+    "chi_shi_keep_full_history": "commands.chi_shi_keep_full_history",
+    "chi_shi_history_limit": "commands.chi_shi_history_limit",
+}
+CONFIG_MIGRATION_MARKER_KEY = "config_migration_flat_to_nested_done"
+FLAT_CONFIG_SCHEMA_DEFAULTS: dict[str, Any] = {
+    "zone": "stone",
+    "enable_zone_fallback": False,
+    "fallback_zones": ["septic"],
+    "enable_article_push": True,
+    "article_sort_latrine": "newest",
+    "article_sort_septic": "random",
+    "article_sort_sediment": "newest",
+    "article_sort_stone": "highest_rated",
+    "enable_questions_push": False,
+    "article_question_bundle_mode": "separate",
+    "questions_zone": "latrine",
+    "questions_enable_zone_fallback": False,
+    "questions_fallback_zones": ["septic"],
+    "questions_sort_latrine": "newest",
+    "questions_sort_septic": "hottest",
+    "questions_sort_sediment": "newest",
+    "questions_sort_stone": "highest_rated",
+    "schedule_times": ["09:00", "21:00"],
+    "schedule_latest_only": False,
+    "detail_hide_domain": False,
+    "timezone": "Asia/Shanghai",
+    "target_sessions": [],
+    "send_merge_forward": True,
+    "send_pdf": True,
+    "pdf_dpi": 170,
+    "pdf_max_size_mb": 50,
+    "http_timeout_sec": 20,
+    "http_retry": 3,
+    "send_concurrency": 3,
+    "temp_keep_files": 30,
+    "pdf_expire_days": 0,
+    "api_base_url": "https://shitspace.xyz",
+    "pdf_base_url": "https://files.shitspace.xyz",
+    "proxy_url": "",
+    "command_admin_only": True,
+    "command_no_permission_reply": True,
+    "chi_shi_group_cooldown_sec": 60,
+    "chi_shi_group_fail_cooldown_sec": 10,
+    "chi_shi_keep_full_history": True,
+    "chi_shi_history_limit": 30,
+}
+_CONFIG_MISSING = object()
 REPORT_STATUS_LABELS: dict[str, str] = {
     "success": "成功",
     "partial": "部分成功",
@@ -123,6 +210,7 @@ REPORT_STATUS_LABELS: dict[str, str] = {
 REPORT_REASON_LABELS: dict[str, str] = {
     "RUN_IN_PROGRESS": "已有推送任务正在执行",
     "NO_TARGET_SESSION_CONFIGURED": "未配置推送目标",
+    "QUESTION_CONFIG_ERROR": "课题配置错误",
     "FETCH_LATEST_FAILED": "获取最新论文失败",
     "ALREADY_DELIVERED": "没有可推送的新论文",
     "LATEST_NOT_FOUND": "未找到最新论文",
@@ -146,6 +234,7 @@ class ShitJournalDailyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
+        self._migrate_flat_config_to_nested()
         self._cron_job_ids: list[str] = []
         self._orchestrated_run_lock = asyncio.Lock()
         self._temp_trim_lock = asyncio.Lock()
@@ -291,6 +380,7 @@ class ShitJournalDailyPlugin(Star):
             return bool(await context.send_message(session, chain))
         return QuestionBatchSender(
             context_getter=lambda: self.context,
+            cfg_int_getter=self._cfg_int,
             history_store=self._question_history_store,
             fetch_question_detail=self._question_api.fetch_question_detail,
             send_session_push=_send_question_session_push,
@@ -298,14 +388,18 @@ class ShitJournalDailyPlugin(Star):
             mask_sensitive_text=mask_sensitive_text,
             detail_hide_domain=lambda: self._cfg_bool("detail_hide_domain", False),
             cfg_bool_getter=self._cfg_bool,
+            max_send_concurrency=MAX_SEND_CONCURRENCY,
+            max_batch_send_concurrency=MAX_BATCH_SEND_CONCURRENCY,
         )
 
     def _create_mixed_batch_sender(self) -> MixedBatchSender:
         return MixedBatchSender(
             context_getter=lambda: self.context,
             cfg_bool_getter=self._cfg_bool,
+            cfg_int_getter=self._cfg_int,
             run_batch_sender=self._run_batch_sender,
             question_batch_sender=self._question_batch_sender,
+            push_messages=self._push_messages,
             logger=logger,
         )
 
@@ -580,12 +674,132 @@ class ShitJournalDailyPlugin(Star):
         data_dir = StarTools.get_data_dir(plugin_name)
         return data_dir.resolve()
 
-    def _cfg(self, key: str, default: Any) -> Any:
+    def _migrate_flat_config_to_nested(self) -> None:
+        if self._is_flat_to_nested_migration_done():
+            return
+        changed = False
+        for flat_key, nested_path in FLAT_TO_NESTED_CONFIG_PATHS.items():
+            has_flat, flat_value = self._read_flat_config_value(flat_key)
+            if not has_flat:
+                continue
+            has_nested, nested_value = self._read_nested_config_value(nested_path)
+            if not has_nested:
+                if self._write_nested_config_value(nested_path, flat_value):
+                    changed = True
+                continue
+            if not self._should_sync_flat_value_to_nested(flat_key, nested_value, flat_value):
+                continue
+            if self._write_nested_config_value(nested_path, flat_value, overwrite=True):
+                changed = True
+        if self._mark_flat_to_nested_migration_done():
+            changed = True
+        if not changed:
+            return
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            save_config()
+
+    def _cfg_mapping(self) -> MutableMapping[str, Any] | None:
+        if isinstance(self.config, MutableMapping):
+            return self.config
+        return None
+
+    def _read_flat_config_value(self, key: str) -> tuple[bool, Any]:
+        mapping = self._cfg_mapping()
+        if mapping is not None:
+            if key in mapping:
+                return True, mapping.get(key)
+            return False, None
         try:
             if hasattr(self.config, "get"):
-                return self.config.get(key, default)
+                value = self.config.get(key, _CONFIG_MISSING)
+                if value is _CONFIG_MISSING:
+                    return False, None
+                return True, value
         except Exception:
             pass
+        return False, None
+
+    def _read_nested_config_value(self, path: str) -> tuple[bool, Any]:
+        mapping = self._cfg_mapping()
+        if mapping is None:
+            return False, None
+        segments = [segment for segment in str(path).split(".") if segment]
+        if not segments:
+            return False, None
+        current: Any = mapping
+        for segment in segments:
+            if not isinstance(current, MutableMapping) or segment not in current:
+                return False, None
+            current = current[segment]
+        return True, current
+
+    def _write_nested_config_value(self, path: str, value: Any, *, overwrite: bool = False) -> bool:
+        mapping = self._cfg_mapping()
+        if mapping is None:
+            return False
+        segments = [segment for segment in str(path).split(".") if segment]
+        if not segments:
+            return False
+        current: MutableMapping[str, Any] = mapping
+        for segment in segments[:-1]:
+            existing = current.get(segment, _CONFIG_MISSING)
+            if existing is _CONFIG_MISSING:
+                child: dict[str, Any] = {}
+                current[segment] = child
+                current = child
+                continue
+            if not isinstance(existing, MutableMapping):
+                return False
+            current = existing
+        leaf = segments[-1]
+        if leaf in current and not overwrite:
+            return False
+        if leaf in current and current[leaf] == value:
+            return False
+        current[leaf] = value
+        return True
+
+    def _is_schema_default_flat_value(self, key: str, value: Any) -> bool:
+        if key not in FLAT_CONFIG_SCHEMA_DEFAULTS:
+            return False
+        return value == FLAT_CONFIG_SCHEMA_DEFAULTS[key]
+
+    def _should_sync_flat_value_to_nested(self, flat_key: str, nested_value: Any, flat_value: Any) -> bool:
+        if not self._is_schema_default_flat_value(flat_key, nested_value):
+            return False
+        return flat_value != nested_value
+
+    def _is_flat_to_nested_migration_done(self) -> bool:
+        has_marker, marker_value = self._read_flat_config_value(CONFIG_MIGRATION_MARKER_KEY)
+        if not has_marker:
+            return False
+        return self._to_bool(marker_value, False)
+
+    def _mark_flat_to_nested_migration_done(self) -> bool:
+        mapping = self._cfg_mapping()
+        if mapping is None:
+            return False
+        current = mapping.get(CONFIG_MIGRATION_MARKER_KEY, _CONFIG_MISSING)
+        if self._to_bool(current, False):
+            return False
+        mapping[CONFIG_MIGRATION_MARKER_KEY] = True
+        return True
+
+    def _cfg(self, key: str, default: Any) -> Any:
+        nested_path = FLAT_TO_NESTED_CONFIG_PATHS.get(key)
+        if nested_path:
+            has_nested, nested_value = self._read_nested_config_value(nested_path)
+            if has_nested:
+                if self._is_flat_to_nested_migration_done():
+                    return nested_value
+                has_flat, flat_value = self._read_flat_config_value(key)
+                if has_flat and self._should_sync_flat_value_to_nested(key, nested_value, flat_value):
+                    return flat_value
+                return nested_value
+        has_flat, flat_value = self._read_flat_config_value(key)
+        if has_flat:
+            return flat_value
         return default
 
     def _cfg_bool(self, key: str, default: bool) -> bool:

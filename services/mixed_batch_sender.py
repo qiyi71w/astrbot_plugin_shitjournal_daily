@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .message_sink import OneBotPlatformResolver
+from .onebot_action import resolve_call_action_from_bot
+from .napcat_stream_uploader import NapCatStreamUploader, STREAM_ACTION_NAME
 from .models import RunBatch, RunBatchReport
-from .push_chain_builder import ArticlePushEntry, PushChainBuilder, QuestionPushEntry
+from .push_chain_builder import ONEBOT_ADAPTER_NAME, ArticlePushEntry, PushChainBuilder, QuestionPushEntry
 from .session_message import is_group_message_session
 
 BUNDLE_MODE_SEPARATE = "separate"
@@ -42,16 +44,22 @@ class MixedBatchSender:
         *,
         context_getter,
         cfg_bool_getter,
+        cfg_int_getter=None,
         run_batch_sender,
         question_batch_sender,
+        push_messages=None,
         logger,
     ):
         self._context_getter = context_getter
+        self._cfg_bool = cfg_bool_getter
+        self._cfg_int_getter = cfg_int_getter
         self._run_batch_sender = run_batch_sender
         self._question_batch_sender = question_batch_sender
+        self._push_messages = push_messages
         self._logger = logger
         self._chains = PushChainBuilder(cfg_bool_getter=cfg_bool_getter)
         self._platform_resolver = OneBotPlatformResolver(cfg_bool_getter=cfg_bool_getter)
+        self._stream_uploader = NapCatStreamUploader()
 
     async def send_selected_batches(
         self,
@@ -218,7 +226,10 @@ class MixedBatchSender:
         return {session: ok for session, ok in results}
 
     async def _send_one_session_bundle(self, *, session: str, bundle: _SessionBundle) -> bool:
-        article_entries = [item.entry for item in bundle.article_batches]
+        article_entries = await self._resolve_session_article_entries(
+            session=session,
+            article_entries=[item.entry for item in bundle.article_batches],
+        )
         question_entries = [item.entry for item in bundle.question_batches]
         context = self._context_getter()
         adapter_name = self._platform_resolver.resolve_platform_name(context, session)
@@ -294,7 +305,14 @@ class MixedBatchSender:
                 include_pdf=include_pdf,
             )
             if not await context.send_message(session, chain):
-                return False
+                self._logger.warning("混合合并转发发送返回失败，回退普通消息：会话=%s", session)
+                return await self._send_standard_bundle(
+                    context=context,
+                    session=session,
+                    adapter_name=adapter_name,
+                    article_entries=article_entries,
+                    question_entries=question_entries,
+                )
             if include_pdf:
                 return True
             for tail in self._chains.build_mixed_pdf_tail_chains(adapter_name=adapter_name, article_entries=article_entries):
@@ -302,8 +320,14 @@ class MixedBatchSender:
                     return False
             return True
         except Exception:
-            self._logger.error("混合合并转发发送失败：会话=%s", session, exc_info=True)
-            return False
+            self._logger.warning("混合合并转发发送异常，回退普通消息：会话=%s", session, exc_info=True)
+            return await self._send_standard_bundle(
+                context=context,
+                session=session,
+                adapter_name=adapter_name,
+                article_entries=article_entries,
+                question_entries=question_entries,
+            )
 
     async def _finalize_article_reports(
         self,
@@ -377,3 +401,65 @@ class MixedBatchSender:
         for prepared in prepared_articles:
             await self._run_batch_sender.release_run_batch_assets(prepared.entry.pdf_file, prepared.entry.png_file)
         await self._run_batch_sender.trim_temp_files_after_send()
+
+    async def _resolve_session_article_entries(
+        self,
+        *,
+        session: str,
+        article_entries: list[ArticlePushEntry],
+    ) -> list[ArticlePushEntry]:
+        if not article_entries:
+            return []
+        context = self._context_getter()
+        adapter_name = self._platform_resolver.resolve_platform_name(context, session)
+        if not self._should_try_stream_upload(adapter_name):
+            return list(article_entries)
+        platform = self._platform_resolver.resolve_platform(context, session)
+        call_action = resolve_call_action_from_bot(getattr(platform, "bot", None))
+        if not callable(call_action):
+            self._logger.warning(
+                "NapCat Stream API 调用入口不可用，回退默认 PDF 发送策略：目标=session:%s 动作=%s",
+                session,
+                STREAM_ACTION_NAME,
+            )
+            return list(article_entries)
+        resolved_entries: list[ArticlePushEntry] = []
+        for entry in article_entries:
+            resolved_entries.append(
+                await self._resolve_onebot_pdf_send_file(
+                    session=session,
+                    entry=entry,
+                    call_action=call_action,
+                ),
+            )
+        return resolved_entries
+
+    async def _resolve_onebot_pdf_send_file(
+        self,
+        *,
+        session: str,
+        entry: ArticlePushEntry,
+        call_action: Any,
+    ) -> ArticlePushEntry:
+        try:
+            stream_file = await self._stream_uploader.upload_pdf(call_action=call_action, pdf_file=entry.pdf_file)
+        except Exception:
+            self._logger.warning(
+                "NapCat Stream API 上传 PDF 失败，回退默认 PDF 发送策略：目标=session:%s 动作=%s",
+                session,
+                STREAM_ACTION_NAME,
+                exc_info=True,
+            )
+            return entry
+        stream_file = str(stream_file).strip()
+        if not stream_file:
+            self._logger.warning(
+                "NapCat Stream API 返回空 file_path，回退默认 PDF 发送策略：目标=session:%s 动作=%s",
+                session,
+                STREAM_ACTION_NAME,
+            )
+            return entry
+        return replace(entry, pdf_send_file=stream_file)
+
+    def _should_try_stream_upload(self, adapter_name: str) -> bool:
+        return self._cfg_bool("send_pdf", False) and str(adapter_name).strip() == ONEBOT_ADAPTER_NAME
