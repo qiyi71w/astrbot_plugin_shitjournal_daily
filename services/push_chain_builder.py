@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +21,20 @@ ONEBOT_MERGE_FORWARD_MESSAGE_TYPES = frozenset({
     MessageType.GROUP_MESSAGE,
     MessageType.FRIEND_MESSAGE,
 })
+
+
+@dataclass(frozen=True)
+class ArticlePushEntry:
+    text: str
+    png_file: Path
+    pdf_file: Path
+    pdf_url: str
+    pdf_send_file: str = ""
+
+
+@dataclass(frozen=True)
+class QuestionPushEntry:
+    text: str
 
 
 class PushChainBuilder:
@@ -115,6 +130,107 @@ class PushChainBuilder:
                         content=[pdf_component],
                     ),
                 )
+        chain = MessageEventResult()
+        chain.chain.append(Nodes(nodes=nodes))
+        return chain
+
+    def build_text_only_chain(self, *, text: str) -> MessageEventResult:
+        chain = MessageEventResult()
+        chain.chain.append(Plain(text))
+        return chain
+
+    def build_text_only_merge_forward_chain(
+        self,
+        *,
+        text: str,
+        sender_uin: str,
+    ) -> MessageEventResult:
+        chain = MessageEventResult()
+        chain.chain.append(
+            Nodes(
+                nodes=[
+                    Node(
+                        name=FORWARD_SENDER_NAME,
+                        uin=str(sender_uin),
+                        content=[Plain(text)],
+                    ),
+                ],
+            ),
+        )
+        return chain
+
+    def build_mixed_standard_main_chain(
+        self,
+        *,
+        article_entries: list[ArticlePushEntry],
+        question_entries: list[QuestionPushEntry],
+    ) -> MessageEventResult:
+        chain = MessageEventResult()
+        for entry in article_entries:
+            chain.chain.extend([Plain(entry.text), Image.fromFileSystem(str(entry.png_file))])
+        for entry in question_entries:
+            chain.chain.append(Plain(entry.text))
+        return chain
+
+    def build_mixed_pdf_tail_chains(
+        self,
+        *,
+        adapter_name: str,
+        article_entries: list[ArticlePushEntry],
+    ) -> list[MessageEventResult]:
+        tails: list[MessageEventResult] = []
+        for entry in article_entries:
+            chain = self.build_pdf_only_chain(
+                adapter_name=adapter_name,
+                pdf_file=entry.pdf_file,
+                pdf_url=entry.pdf_url,
+                pdf_send_file=entry.pdf_send_file,
+            )
+            if chain is not None:
+                tails.append(chain)
+        return tails
+
+    def build_mixed_merge_forward_chain(
+        self,
+        *,
+        adapter_name: str,
+        article_entries: list[ArticlePushEntry],
+        question_entries: list[QuestionPushEntry],
+        sender_uin: str,
+        include_pdf: bool,
+    ) -> MessageEventResult:
+        nodes: list[Node] = []
+        for entry in article_entries:
+            nodes.append(
+                Node(
+                    name=FORWARD_SENDER_NAME,
+                    uin=str(sender_uin),
+                    content=[Plain(entry.text), Image.fromFileSystem(str(entry.png_file))],
+                ),
+            )
+            if include_pdf:
+                pdf_component = self._build_pdf_component(
+                    adapter_name=adapter_name,
+                    pdf_file=entry.pdf_file,
+                    pdf_url=entry.pdf_url,
+                    pdf_send_file=entry.pdf_send_file,
+                )
+                if pdf_component is not None:
+                    nodes.append(
+                        Node(
+                            name=FORWARD_SENDER_NAME,
+                            uin=str(sender_uin),
+                            content=[pdf_component],
+                        ),
+                    )
+        for entry in question_entries:
+            nodes.append(
+                Node(
+                    name=FORWARD_SENDER_NAME,
+                    uin=str(sender_uin),
+                    content=[Plain(entry.text)],
+                ),
+            )
         chain = MessageEventResult()
         chain.chain.append(Nodes(nodes=nodes))
         return chain
