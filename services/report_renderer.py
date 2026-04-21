@@ -5,7 +5,7 @@ from typing import Any, Callable
 from .models import RunReport
 from .warning_text import append_warning_lines, clean_warning_list
 
-DETAIL_URL_BASE = "https://shitjournal.org"
+DETAIL_URL_BASE = "https://shitspace.xyz"
 
 
 class ReportRenderer:

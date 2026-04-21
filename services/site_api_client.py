@@ -12,8 +12,8 @@ from astrbot.api import logger
 from .http_executor import HttpExecutor, HttpRequestOptions
 from .sensitive import mask_sensitive_text
 
-DEFAULT_SITE_API_BASE_URL = "https://api.shitjournal.org"
-DEFAULT_PDF_BASE_URL = "https://files.shitjournal.org"
+DEFAULT_SITE_API_BASE_URL = "https://shitspace.xyz"
+DEFAULT_PDF_BASE_URL = "https://files.shitspace.xyz"
 MAX_FETCH_LIMIT = 20
 MIN_FETCH_LIMIT = 1
 MIN_FETCH_OFFSET = 0
@@ -31,6 +31,27 @@ BACKOFF_BASE_SECONDS = 2
 BACKOFF_MAX_SECONDS = 8
 SUPPORTED_PROXY_SCHEMES = {"http", "https"}
 UNSUPPORTED_PROXY_SCHEME = "socks5"
+ARTICLE_LIST_ENDPOINT = "/api/articles/"
+SPECIAL_ARTICLE_LATEST_ENDPOINTS = {
+    "referendum": "/api/articles/referendum/pending",
+    "published": "/api/articles/published/all",
+}
+ARTICLE_ALLOWED_SORTS = {
+    "latrine": ("newest", "hottest", "random"),
+    "septic": ("random", "hottest", "highest_rated"),
+    "sediment": ("newest",),
+    "stone": ("highest_rated", "random"),
+}
+ARTICLE_DEFAULT_SORTS = {
+    "latrine": "newest",
+    "septic": "random",
+    "sediment": "newest",
+    "stone": "highest_rated",
+}
+
+
+class ArticleConfigError(ValueError):
+    pass
 
 
 class SiteApiClient:
@@ -75,15 +96,15 @@ class SiteApiClient:
     ) -> list[dict[str, Any]]:
         safe_limit = max(MIN_FETCH_LIMIT, min(int(limit), MAX_FETCH_LIMIT))
         safe_offset = max(MIN_FETCH_OFFSET, int(offset))
+        zone_text = str(zone or "").strip()
+        if zone_text in SPECIAL_ARTICLE_LATEST_ENDPOINTS:
+            return await self._fetch_special_latest_submissions(zone=zone_text, limit=safe_limit, offset=safe_offset)
         page_index, page_offset = divmod(safe_offset, safe_limit)
-        url = f"{self._get_api_base_url()}/api/articles/"
-        params = {
-            "zone": zone,
-            "sort": "newest",
-            "discipline": "all",
-            "page": str(page_index + 1),
-            "limit": str(safe_limit),
-        }
+        url, params = self._build_latest_submissions_request(
+            zone=zone_text,
+            page=page_index + 1,
+            limit=safe_limit,
+        )
         data = await self._request_json("GET", url, params=params)
         items = data.get("data") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items:
@@ -95,14 +116,85 @@ class SiteApiClient:
         ]
         return normalized[page_offset:]
 
+    async def _fetch_special_latest_submissions(self, *, zone: str, limit: int, offset: int) -> list[dict[str, Any]]:
+        aggregated: list[dict[str, Any]] = []
+        page = 1
+        total_pages = 1
+        while page <= total_pages:
+            url, params = self._build_latest_submissions_request(zone=zone, page=page, limit=limit)
+            data = await self._request_json("GET", url, params=params)
+            if isinstance(data, dict):
+                total_pages = self._to_positive_int(data.get("total_pages"), total_pages)
+                items = data.get("data")
+            else:
+                items = None
+            if isinstance(items, list):
+                aggregated.extend(
+                    self._normalize_site_article(item)
+                    for item in items
+                    if isinstance(item, dict)
+                )
+            page += 1
+        return aggregated[offset : offset + limit]
+
+    def _to_positive_int(self, value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        if parsed > 0:
+            return parsed
+        return default
+
+    def _build_latest_submissions_request(
+        self,
+        *,
+        zone: str,
+        page: int,
+        limit: int,
+    ) -> tuple[str, dict[str, str]]:
+        zone_text = str(zone or "").strip()
+        page_params = {"page": str(page), "limit": str(limit)}
+        endpoint = SPECIAL_ARTICLE_LATEST_ENDPOINTS.get(zone_text)
+        if endpoint:
+            return f"{self._get_api_base_url()}{endpoint}", page_params
+        params = dict(page_params)
+        params["zone"] = zone_text
+        params["sort"] = self._resolve_article_zone_sort(zone_text)
+        return f"{self._get_api_base_url()}{ARTICLE_LIST_ENDPOINT}", params
+
+    def _resolve_article_zone_sort(self, zone: str) -> str:
+        normalized_zone = str(zone or "").strip().lower()
+        allowed = ARTICLE_ALLOWED_SORTS.get(normalized_zone)
+        if not allowed:
+            raise ArticleConfigError(f"论文分区不受支持：zone={normalized_zone}")
+        default_sort = ARTICLE_DEFAULT_SORTS[normalized_zone]
+        configured_sort = str(self._cfg(f"article_sort_{normalized_zone}", default_sort)).strip().lower()
+        if configured_sort in allowed:
+            return configured_sort
+        allowed_text = ", ".join(allowed)
+        raise ArticleConfigError(
+            f"论文排序配置非法：zone={normalized_zone} sort={configured_sort} allowed={allowed_text}",
+        )
+
     async def fetch_submission_detail(self, paper_id: str) -> dict[str, Any]:
         encoded_paper_id = quote(str(paper_id).strip(), safe="")
         url = f"{self._get_api_base_url()}/api/articles/{encoded_paper_id}"
         data = await self._request_json("GET", url)
-        article = data.get("article") if isinstance(data, dict) else None
+        article = self._extract_submission_article(data)
         if not isinstance(article, dict):
             return {}
         return self._normalize_site_article(article)
+
+    async def request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        return await self._request_json(method, url, params=params, json_body=json_body)
 
     async def resolve_pdf_download_url(self, pdf_url: str) -> str:
         text = str(pdf_url).strip()
@@ -196,16 +288,34 @@ class SiteApiClient:
         author = payload.get("author")
         zone = self._resolve_article_zone(payload)
         author_name = self._read_site_author_field(author, "display_name")
-        institution = self._read_site_author_field(author, "institution")
         normalized = dict(payload)
         normalized["zone"] = zone
         if "manuscript_title" not in normalized:
             normalized["manuscript_title"] = payload.get("title")
         if "author_name" not in normalized:
             normalized["author_name"] = author_name
-        if "institution" not in normalized:
-            normalized["institution"] = institution
         return normalized
+
+    def _extract_submission_article(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        wrapped_article = payload.get("article")
+        if isinstance(wrapped_article, dict):
+            return wrapped_article
+        if self._looks_like_submission_article(payload):
+            return payload
+        return None
+
+    def _looks_like_submission_article(self, payload: dict[str, Any]) -> bool:
+        article_keys = (
+            "id",
+            "title",
+            "manuscript_title",
+            "author",
+            "pdf_url",
+            "created_at",
+        )
+        return any(key in payload for key in article_keys)
 
     def _resolve_article_zone(self, payload: dict[str, Any]) -> str:
         zone = self._to_zone_text(payload.get("zone"))

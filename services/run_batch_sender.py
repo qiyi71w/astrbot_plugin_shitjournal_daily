@@ -98,11 +98,8 @@ class RunBatchSender:
         except Exception as exc:
             return self.build_run_batch_exception_report(report=report, zone=zone, paper_id=paper_id, error=exc)
         finally:
-            await self._release_temp_files(pdf_file, png_file)
-            try:
-                await self._maybe_trim_temp_files()
-            except Exception:
-                self._logger.warning("批次推送后清理临时文件失败。", exc_info=True)
+            await self.release_run_batch_assets(pdf_file, png_file)
+            await self.trim_temp_files_after_send()
     async def prepare_run_batch_delivery(
         self,
         *,
@@ -163,6 +160,14 @@ class RunBatchSender:
                 paper_id=paper_id,
                 success_targets=success_targets,
             )
+    async def release_run_batch_assets(self, pdf_file: Path | None, png_file: Path | None) -> None:
+        await self._release_temp_files(pdf_file, png_file)
+
+    async def trim_temp_files_after_send(self) -> None:
+        try:
+            await self._maybe_trim_temp_files()
+        except Exception:
+            self._logger.warning("批次推送后清理临时文件失败。", exc_info=True)
     def build_run_batch_exception_report(
         self,
         *,

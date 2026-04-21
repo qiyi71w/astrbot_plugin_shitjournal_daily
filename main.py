@@ -4,6 +4,7 @@ import asyncio
 import re
 import sys
 import time
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,14 @@ if __package__:
         CommandGate,
         CronScheduler,
         HistoryStore,
+        MixedBatchSender,
         PdfService,
         PushMessageService,
+        QuestionApiClient,
+        QuestionBatchSender,
+        QuestionHistoryStore,
+        QuestionRunCycleService,
+        QuestionSelector,
         ReportRenderer,
         RunBatchSender,
         RunCycleService,
@@ -39,8 +46,14 @@ else:
         CommandGate,
         CronScheduler,
         HistoryStore,
+        MixedBatchSender,
         PdfService,
         PushMessageService,
+        QuestionApiClient,
+        QuestionBatchSender,
+        QuestionHistoryStore,
+        QuestionRunCycleService,
+        QuestionSelector,
         ReportRenderer,
         RunBatchSender,
         RunCycleService,
@@ -52,36 +65,141 @@ else:
     from services.sensitive import mask_sensitive_text
 
 
-DEFAULT_API_BASE_URL = "https://api.shitjournal.org"
-DEFAULT_PDF_BASE_URL = "https://files.shitjournal.org"
-DETAIL_URL_BASE = "https://shitjournal.org"
+DEFAULT_API_BASE_URL = "https://shitspace.xyz"
+DEFAULT_PDF_BASE_URL = "https://files.shitspace.xyz"
+DETAIL_URL_BASE = "https://shitspace.xyz"
 DEFAULT_ZONE = "stone"
+DEFAULT_QUESTIONS_ZONE = "latrine"
 DEFAULT_SCHEDULE_TIMES = ["09:00", "21:00"]
 MAX_SEND_CONCURRENCY = 20
 MAX_BATCH_SEND_CONCURRENCY = 2
 RUN_FETCH_PAGE_SIZE = 20
 CHI_SHI_FETCH_PAGE_SIZE = 20
 TEMP_TRIM_INTERVAL_SEC = 60
+ARTICLE_STREAM_NAME = "articles"
+QUESTIONS_STREAM_NAME = "questions"
+ORCHESTRATED_REPORT_KIND = "orchestrated_run"
+STREAM_STATE_COMPLETED = "completed"
+STREAM_STATE_DISABLED = "disabled"
+STREAM_STATE_FAILED = "failed"
+STREAM_STATE_PLANNED = "planned"
+ARTICLE_QUESTION_BUNDLE_MODE_SEPARATE = "separate"
+ARTICLE_QUESTION_BUNDLE_MODE_BY_SESSION = "bundle_by_session"
+STREAM_SECTION_TITLES = {
+    ARTICLE_STREAM_NAME: "文章",
+    QUESTIONS_STREAM_NAME: "课题",
+}
 DISCIPLINE_LABELS: dict[str, tuple[str, str]] = {
     "interdisciplinary": ("交叉", "Interdisciplinary"),
     "science": ("理", "Science"),
     "engineering": ("工", "Engineering"),
-    "medical": ("医", "Medical"),
     "agriculture": ("农", "Agriculture"),
-    "law_social": ("法社", "Law & Social"),
-    "humanities": ("文", "Humanities"),
-}
-VISCOSITY_LABELS: dict[str, tuple[str, str]] = {
-    "stringy": ("拉丝型", "Stringy"),
-    "semi": ("半固态", "Semi-solid"),
-    "high-entropy": ("高熵态", "High-Entropy"),
+    "medicine": ("医", "Medicine"),
+    "economics": ("经", "Economics"),
+    "management": ("管", "Management"),
+    "law": ("法", "Law"),
+    "social": ("社", "Social"),
+    "literature": ("文", "Literature"),
+    "history": ("史", "History"),
+    "philosophy": ("哲", "Philosophy"),
+    "art": ("艺", "Art"),
+    "business": ("商", "Business"),
+    "mathematics": ("数", "Mathematics"),
 }
 ZONE_LABELS: dict[str, tuple[str, str]] = {
-    "latrine": ("旱厕", "The Latrine"),
-    "septic": ("化粪池", "Septic Tank"),
-    "stone": ("构石", "The Stone"),
-    "sediment": ("沉淀区", "Sediment"),
+    "latrine": ("NPC", "The Latrine"),
+    "septic": ("人上人", "Septic Tank"),
+    "stone": ("顶级", "The Stone"),
+    "sediment": ("拉完了", "Sediment"),
+    "referendum": ("夯（公投区）", "Referendum"),
+    "published": ("已发表", "Published"),
 }
+FLAT_TO_NESTED_CONFIG_PATHS: dict[str, str] = {
+    "zone": "article.zone",
+    "enable_zone_fallback": "article.enable_zone_fallback",
+    "fallback_zones": "article.fallback_zones",
+    "enable_article_push": "article.enable_article_push",
+    "article_sort_latrine": "article.article_sort_latrine",
+    "article_sort_septic": "article.article_sort_septic",
+    "article_sort_sediment": "article.article_sort_sediment",
+    "article_sort_stone": "article.article_sort_stone",
+    "enable_questions_push": "question.enable_questions_push",
+    "article_question_bundle_mode": "delivery.article_question_bundle_mode",
+    "questions_zone": "question.questions_zone",
+    "questions_enable_zone_fallback": "question.questions_enable_zone_fallback",
+    "questions_fallback_zones": "question.questions_fallback_zones",
+    "questions_sort_latrine": "question.questions_sort_latrine",
+    "questions_sort_septic": "question.questions_sort_septic",
+    "questions_sort_sediment": "question.questions_sort_sediment",
+    "questions_sort_stone": "question.questions_sort_stone",
+    "schedule_times": "schedule.schedule_times",
+    "schedule_latest_only": "schedule.schedule_latest_only",
+    "detail_hide_domain": "delivery.detail_hide_domain",
+    "timezone": "schedule.timezone",
+    "target_sessions": "delivery.target_sessions",
+    "send_merge_forward": "delivery.send_merge_forward",
+    "send_pdf": "delivery.send_pdf",
+    "pdf_dpi": "assets.pdf_dpi",
+    "pdf_max_size_mb": "assets.pdf_max_size_mb",
+    "http_timeout_sec": "site.http_timeout_sec",
+    "http_retry": "site.http_retry",
+    "send_concurrency": "delivery.send_concurrency",
+    "temp_keep_files": "assets.temp_keep_files",
+    "pdf_expire_days": "assets.pdf_expire_days",
+    "api_base_url": "site.api_base_url",
+    "pdf_base_url": "site.pdf_base_url",
+    "proxy_url": "site.proxy_url",
+    "command_admin_only": "commands.command_admin_only",
+    "command_no_permission_reply": "commands.command_no_permission_reply",
+    "chi_shi_group_cooldown_sec": "commands.chi_shi_group_cooldown_sec",
+    "chi_shi_group_fail_cooldown_sec": "commands.chi_shi_group_fail_cooldown_sec",
+    "chi_shi_keep_full_history": "commands.chi_shi_keep_full_history",
+    "chi_shi_history_limit": "commands.chi_shi_history_limit",
+}
+CONFIG_MIGRATION_MARKER_KEY = "config_migration_flat_to_nested_done"
+FLAT_CONFIG_SCHEMA_DEFAULTS: dict[str, Any] = {
+    "zone": "stone",
+    "enable_zone_fallback": False,
+    "fallback_zones": ["septic"],
+    "enable_article_push": True,
+    "article_sort_latrine": "newest",
+    "article_sort_septic": "random",
+    "article_sort_sediment": "newest",
+    "article_sort_stone": "highest_rated",
+    "enable_questions_push": False,
+    "article_question_bundle_mode": "separate",
+    "questions_zone": "latrine",
+    "questions_enable_zone_fallback": False,
+    "questions_fallback_zones": ["septic"],
+    "questions_sort_latrine": "newest",
+    "questions_sort_septic": "hottest",
+    "questions_sort_sediment": "newest",
+    "questions_sort_stone": "highest_rated",
+    "schedule_times": ["09:00", "21:00"],
+    "schedule_latest_only": False,
+    "detail_hide_domain": False,
+    "timezone": "Asia/Shanghai",
+    "target_sessions": [],
+    "send_merge_forward": True,
+    "send_pdf": True,
+    "pdf_dpi": 170,
+    "pdf_max_size_mb": 50,
+    "http_timeout_sec": 20,
+    "http_retry": 3,
+    "send_concurrency": 3,
+    "temp_keep_files": 30,
+    "pdf_expire_days": 0,
+    "api_base_url": "https://shitspace.xyz",
+    "pdf_base_url": "https://files.shitspace.xyz",
+    "proxy_url": "",
+    "command_admin_only": True,
+    "command_no_permission_reply": True,
+    "chi_shi_group_cooldown_sec": 60,
+    "chi_shi_group_fail_cooldown_sec": 10,
+    "chi_shi_keep_full_history": True,
+    "chi_shi_history_limit": 30,
+}
+_CONFIG_MISSING = object()
 REPORT_STATUS_LABELS: dict[str, str] = {
     "success": "成功",
     "partial": "部分成功",
@@ -92,6 +210,7 @@ REPORT_STATUS_LABELS: dict[str, str] = {
 REPORT_REASON_LABELS: dict[str, str] = {
     "RUN_IN_PROGRESS": "已有推送任务正在执行",
     "NO_TARGET_SESSION_CONFIGURED": "未配置推送目标",
+    "QUESTION_CONFIG_ERROR": "课题配置错误",
     "FETCH_LATEST_FAILED": "获取最新论文失败",
     "ALREADY_DELIVERED": "没有可推送的新论文",
     "LATEST_NOT_FOUND": "未找到最新论文",
@@ -115,7 +234,9 @@ class ShitJournalDailyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
+        self._migrate_flat_config_to_nested()
         self._cron_job_ids: list[str] = []
+        self._orchestrated_run_lock = asyncio.Lock()
         self._temp_trim_lock = asyncio.Lock()
         self._next_temp_trim_monotonic = 0.0
         self._plugin_data_dir = Path(".")
@@ -137,14 +258,36 @@ class ShitJournalDailyPlugin(Star):
             normalize_session_list=self._normalize_session_list,
             normalize_zone_name=self._normalize_zone_name,
         )
+        self._question_api = self._create_question_api_client()
+        self._question_history_store = self._create_question_history_store()
         self._run_selector = self._create_run_selector()
+        self._question_selector = self._create_question_selector()
         self._asset_pipeline = self._create_asset_pipeline()
         self._report_renderer = self._create_report_renderer()
         self._command_gate = self._create_command_gate()
         self._run_batch_sender = self._create_run_batch_sender()
+        self._question_batch_sender = self._create_question_batch_sender()
+        self._mixed_batch_sender = self._create_mixed_batch_sender()
         self._run_cycle_service = self._create_run_cycle_service()
+        self._questions_run_cycle_service = self._create_questions_run_cycle_service()
         self._cron_scheduler = self._create_cron_scheduler()
         self._chi_shi_service = self._create_chi_shi_service()
+
+    def _create_question_api_client(self) -> QuestionApiClient:
+        return QuestionApiClient(
+            cfg_getter=self._cfg,
+            cfg_int_getter=self._cfg_int,
+            request_json=self._site_api.request_json,
+            default_api_base_url=DEFAULT_API_BASE_URL,
+        )
+
+    def _create_question_history_store(self) -> QuestionHistoryStore:
+        return QuestionHistoryStore(
+            kv_getter=self.get_kv_data,
+            kv_putter=self.put_kv_data,
+            normalize_session_list=self._normalize_session_list,
+            normalize_zone_name=self._normalize_zone_name,
+        )
 
     def _create_run_selector(self) -> RunSelector:
         return RunSelector(
@@ -162,6 +305,7 @@ class ShitJournalDailyPlugin(Star):
                 session_key,
             ),
             logger=logger,
+            detail_url_base=DETAIL_URL_BASE,
         )
 
     def _create_asset_pipeline(self) -> AssetPipeline:
@@ -179,8 +323,15 @@ class ShitJournalDailyPlugin(Star):
             detail_url_base=DETAIL_URL_BASE,
             detail_hide_domain=lambda: self._cfg_bool("detail_hide_domain", False),
             discipline_labels=DISCIPLINE_LABELS,
-            viscosity_labels=VISCOSITY_LABELS,
             zone_labels=ZONE_LABELS,
+        )
+
+    def _create_question_selector(self) -> QuestionSelector:
+        return QuestionSelector(
+            fetch_latest_questions=self._question_api.fetch_latest_questions,
+            get_run_sent_histories=self._question_history_store.get_run_sent_histories,
+            logger=logger,
+            detail_url_base=DETAIL_URL_BASE,
         )
 
     def _create_report_renderer(self) -> ReportRenderer:
@@ -224,6 +375,34 @@ class ShitJournalDailyPlugin(Star):
             max_batch_send_concurrency=MAX_BATCH_SEND_CONCURRENCY,
         )
 
+    def _create_question_batch_sender(self) -> QuestionBatchSender:
+        async def _send_question_session_push(*, context: Any, session: str, chain: Any) -> bool:
+            return bool(await context.send_message(session, chain))
+        return QuestionBatchSender(
+            context_getter=lambda: self.context,
+            cfg_int_getter=self._cfg_int,
+            history_store=self._question_history_store,
+            fetch_question_detail=self._question_api.fetch_question_detail,
+            send_session_push=_send_question_session_push,
+            logger=logger,
+            mask_sensitive_text=mask_sensitive_text,
+            detail_hide_domain=lambda: self._cfg_bool("detail_hide_domain", False),
+            cfg_bool_getter=self._cfg_bool,
+            max_send_concurrency=MAX_SEND_CONCURRENCY,
+            max_batch_send_concurrency=MAX_BATCH_SEND_CONCURRENCY,
+        )
+
+    def _create_mixed_batch_sender(self) -> MixedBatchSender:
+        return MixedBatchSender(
+            context_getter=lambda: self.context,
+            cfg_bool_getter=self._cfg_bool,
+            cfg_int_getter=self._cfg_int,
+            run_batch_sender=self._run_batch_sender,
+            question_batch_sender=self._question_batch_sender,
+            push_messages=self._push_messages,
+            logger=logger,
+        )
+
     def _create_run_cycle_service(self) -> RunCycleService:
         return RunCycleService(
             cfg_getter=self._cfg,
@@ -248,6 +427,20 @@ class ShitJournalDailyPlugin(Star):
             run_fetch_page_size=RUN_FETCH_PAGE_SIZE,
         )
 
+    def _create_questions_run_cycle_service(self) -> QuestionRunCycleService:
+        return QuestionRunCycleService(
+            cfg_getter=self._cfg,
+            question_selector=self._question_selector,
+            question_history_store=self._question_history_store,
+            question_batch_sender=self._question_batch_sender,
+            get_all_target_sessions=lambda cfg_targets: self._history_store.get_all_target_sessions(cfg_targets),
+            get_primary_zone=self._get_questions_primary_zone,
+            get_candidate_zones=self._get_questions_candidate_zones,
+            logger=logger,
+            mask_sensitive_text=mask_sensitive_text,
+            run_fetch_page_size=RUN_FETCH_PAGE_SIZE,
+        )
+
     def _create_cron_scheduler(self) -> CronScheduler:
         def _update_cron_job_ids(ids: list[str]) -> None:
             self._cron_job_ids = [str(job_id).strip() for job_id in ids if str(job_id).strip()]
@@ -261,8 +454,8 @@ class ShitJournalDailyPlugin(Star):
             kv_putter=self.put_kv_data,
             get_cron_job_ids=lambda: list(self._cron_job_ids),
             set_cron_job_ids=_update_cron_job_ids,
-            run_cycle=lambda **kwargs: self._run_cycle_service.run_cycle(**kwargs),
-            render_report=lambda report, include_debug=False: self._report_renderer.render_report(
+            run_cycle=lambda **kwargs: self._run_enabled_streams(**kwargs),
+            render_report=lambda report, include_debug=False: self._render_run_cycle_report(
                 report,
                 include_debug=include_debug,
             ),
@@ -388,8 +581,8 @@ class ShitJournalDailyPlugin(Star):
 
         if action == "run":
             force = bool(arg) and arg.split()[0] == "force"
-            report = await self._run_cycle_service.run_cycle(force=force, source=f"手动:{event.get_sender_id()}")
-            yield event.plain_result(self._report_renderer.render_report(report))
+            report = await self._run_enabled_streams(force=force, source=f"手动:{event.get_sender_id()}")
+            yield event.plain_result(self._render_run_cycle_report(report))
             return
 
         help_text = (
@@ -420,6 +613,9 @@ class ShitJournalDailyPlugin(Star):
         if not normalized:
             return
         event, _, _ = normalized
+        if not self._is_article_push_enabled():
+            yield event.plain_result("articles 推送已关闭，“我要赤石”当前不可用。")
+            return
         scope_label = self._get_chi_shi_session_scope_text(event)
         session_key = event.unified_msg_origin
         ignore_cooldown = self._command_gate.is_admin_event(event)
@@ -478,12 +674,132 @@ class ShitJournalDailyPlugin(Star):
         data_dir = StarTools.get_data_dir(plugin_name)
         return data_dir.resolve()
 
-    def _cfg(self, key: str, default: Any) -> Any:
+    def _migrate_flat_config_to_nested(self) -> None:
+        if self._is_flat_to_nested_migration_done():
+            return
+        changed = False
+        for flat_key, nested_path in FLAT_TO_NESTED_CONFIG_PATHS.items():
+            has_flat, flat_value = self._read_flat_config_value(flat_key)
+            if not has_flat:
+                continue
+            has_nested, nested_value = self._read_nested_config_value(nested_path)
+            if not has_nested:
+                if self._write_nested_config_value(nested_path, flat_value):
+                    changed = True
+                continue
+            if not self._should_sync_flat_value_to_nested(flat_key, nested_value, flat_value):
+                continue
+            if self._write_nested_config_value(nested_path, flat_value, overwrite=True):
+                changed = True
+        if self._mark_flat_to_nested_migration_done():
+            changed = True
+        if not changed:
+            return
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            save_config()
+
+    def _cfg_mapping(self) -> MutableMapping[str, Any] | None:
+        if isinstance(self.config, MutableMapping):
+            return self.config
+        return None
+
+    def _read_flat_config_value(self, key: str) -> tuple[bool, Any]:
+        mapping = self._cfg_mapping()
+        if mapping is not None:
+            if key in mapping:
+                return True, mapping.get(key)
+            return False, None
         try:
             if hasattr(self.config, "get"):
-                return self.config.get(key, default)
+                value = self.config.get(key, _CONFIG_MISSING)
+                if value is _CONFIG_MISSING:
+                    return False, None
+                return True, value
         except Exception:
             pass
+        return False, None
+
+    def _read_nested_config_value(self, path: str) -> tuple[bool, Any]:
+        mapping = self._cfg_mapping()
+        if mapping is None:
+            return False, None
+        segments = [segment for segment in str(path).split(".") if segment]
+        if not segments:
+            return False, None
+        current: Any = mapping
+        for segment in segments:
+            if not isinstance(current, MutableMapping) or segment not in current:
+                return False, None
+            current = current[segment]
+        return True, current
+
+    def _write_nested_config_value(self, path: str, value: Any, *, overwrite: bool = False) -> bool:
+        mapping = self._cfg_mapping()
+        if mapping is None:
+            return False
+        segments = [segment for segment in str(path).split(".") if segment]
+        if not segments:
+            return False
+        current: MutableMapping[str, Any] = mapping
+        for segment in segments[:-1]:
+            existing = current.get(segment, _CONFIG_MISSING)
+            if existing is _CONFIG_MISSING:
+                child: dict[str, Any] = {}
+                current[segment] = child
+                current = child
+                continue
+            if not isinstance(existing, MutableMapping):
+                return False
+            current = existing
+        leaf = segments[-1]
+        if leaf in current and not overwrite:
+            return False
+        if leaf in current and current[leaf] == value:
+            return False
+        current[leaf] = value
+        return True
+
+    def _is_schema_default_flat_value(self, key: str, value: Any) -> bool:
+        if key not in FLAT_CONFIG_SCHEMA_DEFAULTS:
+            return False
+        return value == FLAT_CONFIG_SCHEMA_DEFAULTS[key]
+
+    def _should_sync_flat_value_to_nested(self, flat_key: str, nested_value: Any, flat_value: Any) -> bool:
+        if not self._is_schema_default_flat_value(flat_key, nested_value):
+            return False
+        return flat_value != nested_value
+
+    def _is_flat_to_nested_migration_done(self) -> bool:
+        has_marker, marker_value = self._read_flat_config_value(CONFIG_MIGRATION_MARKER_KEY)
+        if not has_marker:
+            return False
+        return self._to_bool(marker_value, False)
+
+    def _mark_flat_to_nested_migration_done(self) -> bool:
+        mapping = self._cfg_mapping()
+        if mapping is None:
+            return False
+        current = mapping.get(CONFIG_MIGRATION_MARKER_KEY, _CONFIG_MISSING)
+        if self._to_bool(current, False):
+            return False
+        mapping[CONFIG_MIGRATION_MARKER_KEY] = True
+        return True
+
+    def _cfg(self, key: str, default: Any) -> Any:
+        nested_path = FLAT_TO_NESTED_CONFIG_PATHS.get(key)
+        if nested_path:
+            has_nested, nested_value = self._read_nested_config_value(nested_path)
+            if has_nested:
+                if self._is_flat_to_nested_migration_done():
+                    return nested_value
+                has_flat, flat_value = self._read_flat_config_value(key)
+                if has_flat and self._should_sync_flat_value_to_nested(key, nested_value, flat_value):
+                    return flat_value
+                return nested_value
+        has_flat, flat_value = self._read_flat_config_value(key)
+        if has_flat:
+            return flat_value
         return default
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
@@ -530,6 +846,294 @@ class ShitJournalDailyPlugin(Star):
         zone = self._normalize_zone_name(self._cfg("zone", DEFAULT_ZONE))
         return zone or DEFAULT_ZONE
 
+    def _get_questions_primary_zone(self) -> str:
+        zone = self._normalize_zone_name(self._cfg("questions_zone", DEFAULT_QUESTIONS_ZONE))
+        return zone or DEFAULT_QUESTIONS_ZONE
+
+    def _is_article_push_enabled(self) -> bool:
+        return self._cfg_bool("enable_article_push", True)
+
+    def _is_questions_push_enabled(self) -> bool:
+        return self._cfg_bool("enable_questions_push", False)
+
+    async def _run_enabled_streams(self, *, force: bool, source: str, latest_only: bool = False) -> dict[str, Any]:
+        if self._orchestrated_run_lock.locked():
+            return self._build_orchestrated_run_in_progress_report(
+                force=force,
+                source=source,
+                latest_only=latest_only,
+            )
+        async with self._orchestrated_run_lock:
+            try:
+                return await self._run_enabled_streams_locked(
+                    force=force,
+                    source=source,
+                    latest_only=latest_only,
+                )
+            finally:
+                await self._trim_temp_files_after_orchestrated_run()
+
+    async def _run_enabled_streams_locked(self, *, force: bool, source: str, latest_only: bool) -> dict[str, Any]:
+        article_entry = await self._plan_named_stream(
+            stream_name=ARTICLE_STREAM_NAME,
+            enabled=self._is_article_push_enabled(),
+            planner=lambda **kwargs: self._run_cycle_service.plan_run_cycle(**kwargs),
+            force=force,
+            source=source,
+            latest_only=latest_only,
+            always_include_latest_only=False,
+        )
+        question_entry = await self._plan_named_stream(
+            stream_name=QUESTIONS_STREAM_NAME,
+            enabled=self._is_questions_push_enabled(),
+            planner=lambda **kwargs: self._get_questions_run_cycle_service().plan_run_cycle(**kwargs),
+            force=force,
+            source=source,
+            latest_only=latest_only,
+            always_include_latest_only=True,
+        )
+        article_batch_reports, question_batch_reports, send_error = await self._run_unified_send_phase(
+            article_entry=article_entry,
+            question_entry=question_entry,
+        )
+        if send_error:
+            streams = {
+                ARTICLE_STREAM_NAME: self._mark_stream_send_failed(article_entry, send_error),
+                QUESTIONS_STREAM_NAME: self._mark_stream_send_failed(question_entry, send_error),
+            }
+            return {"kind": ORCHESTRATED_REPORT_KIND, "streams": streams}
+        streams = {
+            ARTICLE_STREAM_NAME: await self._finalize_named_stream(
+                stream_name=ARTICLE_STREAM_NAME,
+                stream_entry=article_entry,
+                finalizer=lambda **kwargs: self._run_cycle_service.finalize_run_cycle(**kwargs),
+                batch_reports=article_batch_reports,
+            ),
+            QUESTIONS_STREAM_NAME: await self._finalize_named_stream(
+                stream_name=QUESTIONS_STREAM_NAME,
+                stream_entry=question_entry,
+                finalizer=lambda **kwargs: self._get_questions_run_cycle_service().finalize_run_cycle(**kwargs),
+                batch_reports=question_batch_reports,
+            ),
+        }
+        return {"kind": ORCHESTRATED_REPORT_KIND, "streams": streams}
+
+    def _build_orchestrated_run_in_progress_report(
+        self,
+        *,
+        force: bool,
+        source: str,
+        latest_only: bool,
+    ) -> dict[str, Any]:
+        streams = {
+            ARTICLE_STREAM_NAME: self._build_stream_run_in_progress_entry(
+                enabled=self._is_article_push_enabled(),
+                force=force,
+                source=source,
+                latest_only=latest_only,
+            ),
+            QUESTIONS_STREAM_NAME: self._build_stream_run_in_progress_entry(
+                enabled=self._is_questions_push_enabled(),
+                force=force,
+                source=source,
+                latest_only=latest_only,
+            ),
+        }
+        return {"kind": ORCHESTRATED_REPORT_KIND, "streams": streams}
+
+    def _build_stream_run_in_progress_entry(
+        self,
+        *,
+        enabled: bool,
+        force: bool,
+        source: str,
+        latest_only: bool,
+    ) -> dict[str, Any]:
+        if not enabled:
+            return {"state": STREAM_STATE_DISABLED}
+        return {
+            "state": STREAM_STATE_COMPLETED,
+            "report": {
+                "status": "skipped",
+                "reason_code": "RUN_IN_PROGRESS",
+                "source": source,
+                "force": force,
+                "latest_only": latest_only,
+            },
+        }
+
+    async def _trim_temp_files_after_orchestrated_run(self) -> None:
+        try:
+            await self._maybe_trim_temp_files()
+        except Exception:
+            logger.warning("执行编排推送后清理临时文件失败。", exc_info=True)
+
+    async def _run_unified_send_phase(
+        self,
+        *,
+        article_entry: dict[str, Any],
+        question_entry: dict[str, Any],
+    ) -> tuple[list[Any], list[Any], str]:
+        article_batches = self._extract_stream_batches(article_entry)
+        question_batches = self._extract_stream_batches(question_entry)
+        if not article_batches and not question_batches:
+            return [], [], ""
+        try:
+            article_batch_reports, question_batch_reports = await self._send_selected_batches(
+                article_batches=article_batches,
+                question_batches=question_batches,
+                bundle_mode=self._get_article_question_bundle_mode(),
+                send_semaphore=asyncio.Semaphore(self._run_batch_sender.get_configured_send_concurrency()),
+            )
+            return article_batch_reports, question_batch_reports, ""
+        except Exception as exc:
+            masked = mask_sensitive_text(str(exc).strip()) or "统一发送阶段失败"
+            logger.error("统一发送阶段失败：%s", masked, exc_info=True)
+            return [], [], masked
+
+    async def _plan_named_stream(
+        self,
+        *,
+        stream_name: str,
+        enabled: bool,
+        planner: Any,
+        force: bool,
+        source: str,
+        latest_only: bool,
+        always_include_latest_only: bool,
+    ) -> dict[str, Any]:
+        if not enabled:
+            return {"state": STREAM_STATE_DISABLED}
+        kwargs = self._build_stream_run_kwargs(
+            force=force,
+            source=source,
+            latest_only=latest_only,
+            always_include_latest_only=always_include_latest_only,
+        )
+        try:
+            plan = await planner(**kwargs)
+        except Exception as exc:
+            masked = mask_sensitive_text(str(exc).strip()) or f"{stream_name} 执行失败"
+            logger.error("%s 流执行失败：%s", stream_name, masked, exc_info=True)
+            return {"state": STREAM_STATE_FAILED, "error_message": masked}
+        return {"state": STREAM_STATE_PLANNED, "plan": plan}
+
+    async def _finalize_named_stream(
+        self,
+        *,
+        stream_name: str,
+        stream_entry: dict[str, Any],
+        finalizer: Any,
+        batch_reports: list[Any],
+    ) -> dict[str, Any]:
+        state = str(stream_entry.get("state", "")).strip()
+        if state != STREAM_STATE_PLANNED:
+            return self._strip_stream_entry(stream_entry)
+        plan = stream_entry.get("plan", {})
+        try:
+            report = await finalizer(plan=plan, batch_reports=batch_reports)
+        except Exception as exc:
+            masked = mask_sensitive_text(str(exc).strip()) or f"{stream_name} 结算失败"
+            logger.error("%s 流结算失败：%s", stream_name, masked, exc_info=True)
+            return {"state": STREAM_STATE_FAILED, "error_message": masked}
+        return {"state": STREAM_STATE_COMPLETED, "report": report}
+
+    def _extract_stream_batches(self, stream_entry: dict[str, Any]) -> list[Any]:
+        state = str(stream_entry.get("state", "")).strip()
+        if state != STREAM_STATE_PLANNED:
+            return []
+        plan = stream_entry.get("plan", {})
+        if isinstance(plan, dict):
+            return list(plan.get("batches", []) or [])
+        return list(getattr(plan, "batches", []) or [])
+
+    def _mark_stream_send_failed(self, stream_entry: dict[str, Any], message: str) -> dict[str, Any]:
+        state = str(stream_entry.get("state", "")).strip()
+        if state != STREAM_STATE_PLANNED:
+            return self._strip_stream_entry(stream_entry)
+        return {"state": STREAM_STATE_FAILED, "error_message": message}
+
+    def _strip_stream_entry(self, stream_entry: dict[str, Any]) -> dict[str, Any]:
+        state = str(stream_entry.get("state", "")).strip()
+        if state == STREAM_STATE_DISABLED:
+            return {"state": STREAM_STATE_DISABLED}
+        if state == STREAM_STATE_FAILED:
+            return {"state": STREAM_STATE_FAILED, "error_message": stream_entry.get("error_message", "")}
+        return {"state": state}
+
+    def _build_stream_run_kwargs(
+        self,
+        *,
+        force: bool,
+        source: str,
+        latest_only: bool,
+        always_include_latest_only: bool,
+    ) -> dict[str, Any]:
+        kwargs = {"force": force, "source": source}
+        if always_include_latest_only or latest_only:
+            kwargs["latest_only"] = latest_only
+        return kwargs
+
+    async def _send_selected_batches(
+        self,
+        *,
+        article_batches: list[Any],
+        question_batches: list[Any],
+        bundle_mode: str,
+        send_semaphore: asyncio.Semaphore | None = None,
+    ) -> tuple[list[Any], list[Any]]:
+        return await self._mixed_batch_sender.send_selected_batches(
+            article_batches=article_batches,
+            question_batches=question_batches,
+            bundle_mode=bundle_mode,
+            send_semaphore=send_semaphore,
+        )
+
+    def _get_article_question_bundle_mode(self) -> str:
+        mode = str(
+            self._cfg("article_question_bundle_mode", ARTICLE_QUESTION_BUNDLE_MODE_SEPARATE),
+        ).strip().lower()
+        if mode in {ARTICLE_QUESTION_BUNDLE_MODE_SEPARATE, ARTICLE_QUESTION_BUNDLE_MODE_BY_SESSION}:
+            return mode
+        return ARTICLE_QUESTION_BUNDLE_MODE_SEPARATE
+
+    def _get_questions_run_cycle_service(self) -> Any:
+        service = getattr(self, "_questions_run_cycle_service", None)
+        if service is None:
+            raise RuntimeError("questions flow service 未接线")
+        plan_run_cycle = getattr(service, "plan_run_cycle", None)
+        finalize_run_cycle = getattr(service, "finalize_run_cycle", None)
+        if not callable(plan_run_cycle):
+            raise RuntimeError("questions flow service 缺少 plan_run_cycle 接口")
+        if not callable(finalize_run_cycle):
+            raise RuntimeError("questions flow service 缺少 finalize_run_cycle 接口")
+        return service
+
+    def _render_run_cycle_report(self, report: Any, *, include_debug: bool = False) -> str:
+        if not self._is_orchestrated_report(report):
+            return self._report_renderer.render_report(report, include_debug=include_debug)
+        parts = []
+        streams = dict(report.get("streams", {}))
+        for stream_name in (ARTICLE_STREAM_NAME, QUESTIONS_STREAM_NAME):
+            parts.append(self._render_stream_section(stream_name, streams.get(stream_name, {}), include_debug))
+        return "\n\n".join(parts)
+
+    def _render_stream_section(self, stream_name: str, stream_report: Any, include_debug: bool) -> str:
+        title = f"{STREAM_SECTION_TITLES.get(stream_name, stream_name)}:"
+        state = str(dict(stream_report).get("state", "")).strip()
+        if state == STREAM_STATE_DISABLED:
+            return f"{title}\n已关闭"
+        if state == STREAM_STATE_FAILED:
+            message = str(dict(stream_report).get("error_message", "")).strip() or "执行失败"
+            return f"{title}\n状态: 失败\n原因: {message}"
+        nested = dict(stream_report).get("report", {})
+        return f"{title}\n{self._report_renderer.render_report(nested, include_debug=include_debug)}"
+
+    def _is_orchestrated_report(self, report: Any) -> bool:
+        if not isinstance(report, dict):
+            return False
+        return str(report.get("kind", "")).strip() == ORCHESTRATED_REPORT_KIND
+
     def _normalize_zone_name(self, value: Any) -> str:
         return str(value or "").strip().lower()
 
@@ -559,6 +1163,19 @@ class ShitJournalDailyPlugin(Star):
 
         seen = {primary_zone}
         for zone in self._normalize_zone_list(self._cfg("fallback_zones", [])):
+            if zone in seen:
+                continue
+            seen.add(zone)
+            zones.append(zone)
+        return zones
+
+    def _get_questions_candidate_zones(self, primary_zone: str) -> list[str]:
+        zones = [primary_zone]
+        if not self._cfg_bool("questions_enable_zone_fallback", False):
+            return zones
+
+        seen = {primary_zone}
+        for zone in self._normalize_zone_list(self._cfg("questions_fallback_zones", [])):
             if zone in seen:
                 continue
             seen.add(zone)
